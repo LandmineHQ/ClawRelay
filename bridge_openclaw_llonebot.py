@@ -6,6 +6,7 @@ import logging
 import mimetypes
 import os
 import re
+import time
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -64,6 +65,7 @@ class Config:
     context_flush_limit: int = env_int("CONTEXT_FLUSH_LIMIT", 12)
     max_image_attachments: int = env_int("MAX_IMAGE_ATTACHMENTS", 3)
     max_image_download_bytes: int = env_int("MAX_IMAGE_DOWNLOAD_BYTES", 6 * 1024 * 1024)
+    image_model_probe_ttl_sec: int = env_int("IMAGE_MODEL_PROBE_TTL_SEC", 300)
 
     group_require_at: bool = env_bool("GROUP_REQUIRE_AT", True)
     group_prefix: str = os.getenv("GROUP_PREFIX", "/ai")
@@ -105,6 +107,10 @@ class OpenClawOneBotBridge:
         self.pending_context: dict[str, deque[PendingObservation]] = defaultdict(
             lambda: deque(maxlen=max(2, self.cfg.context_observation_limit))
         )
+        self.preferred_openclaw_ws_url: str = ""
+        self.image_support_cache_until: float = 0.0
+        self.image_support_cache_value: bool | None = None
+        self.image_support_model_desc: str = "unknown"
 
     def _onebot_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -172,6 +178,20 @@ class OpenClawOneBotBridge:
             merged.append(img)
         return merged
 
+    @staticmethod
+    def _image_hash_hint(img: MessageImage) -> str:
+        if img.file.strip():
+            return os.path.basename(img.file.strip())
+        if img.url.strip():
+            path = urlparse(img.url.strip()).path
+            base = os.path.basename(path)
+            if base:
+                return base
+        return "unknown"
+
+    def _image_tag(self, img: MessageImage) -> str:
+        return f"[图片:{self._image_hash_hint(img)}]"
+
     def _extract_message_from_payload(
         self, payload: Any, self_qq: str
     ) -> ParsedMessage:
@@ -194,8 +214,9 @@ class OpenClawOneBotBridge:
                 elif seg_type == "image":
                     url = str(data.get("url", "")).strip()
                     file = str(data.get("file", "")).strip()
-                    images.append(MessageImage(url=url, file=file))
-                    text_parts.append("[图片]")
+                    img = MessageImage(url=url, file=file)
+                    images.append(img)
+                    text_parts.append(self._image_tag(img))
             text = re.sub(r"\s+", " ", "".join(text_parts)).strip()
             return ParsedMessage(text=text, mentioned=mentioned, images=images)
 
@@ -213,13 +234,12 @@ class OpenClawOneBotBridge:
                         mentioned = True
                     continue
                 if cq_type == "image":
-                    images.append(
-                        MessageImage(
-                            url=params.get("url", "").strip(),
-                            file=params.get("file", "").strip(),
-                        )
+                    img = MessageImage(
+                        url=params.get("url", "").strip(),
+                        file=params.get("file", "").strip(),
                     )
-                    text_parts.append("[图片]")
+                    images.append(img)
+                    text_parts.append(self._image_tag(img))
             text_parts.append(payload[last:])
             merged = "".join(text_parts)
 
@@ -230,6 +250,14 @@ class OpenClawOneBotBridge:
                 flags=re.IGNORECASE,
             ):
                 images.append(MessageImage(url="", file=img_name.strip()))
+
+            # 统一把 [图片]xxx.png 规范成 [图片:xxx.png]
+            merged = re.sub(
+                r"\[图片\]\s*([A-Za-z0-9._-]+\.(?:png|jpg|jpeg|gif|webp|bmp))",
+                r"[图片:\1]",
+                merged,
+                flags=re.IGNORECASE,
+            )
 
             text = re.sub(r"\s+", " ", merged).strip()
             return ParsedMessage(text=text, mentioned=mentioned, images=images)
@@ -266,8 +294,8 @@ class OpenClawOneBotBridge:
     ) -> str:
         display = normalized_text or "（无文本）"
         if images:
-            refs = [img.url or img.file or "unknown" for img in images]
-            display = f"{display} | 图片: {', '.join(refs)}"
+            refs = [os.path.basename(img.file.strip()) if img.file.strip() else "unknown" for img in images]
+            display = f"{display} | 图片哈希: {', '.join(refs)}"
         time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
         return f"{time_str} {sender_name}: {display}"
 
@@ -339,6 +367,10 @@ class OpenClawOneBotBridge:
             + "\n\n请结合以上记录，回复最后一条来自用户的消息。\n"
             + f"最后一条消息：{latest}"
         )
+
+    @staticmethod
+    def _is_image_only_text(text: str) -> bool:
+        return bool(re.fullmatch(r"\s*(?:\[图片:[^\]]+\]\s*)+", text or ""))
 
     def _collect_recent_images(self, pending: list[PendingObservation]) -> list[MessageImage]:
         out: list[MessageImage] = []
@@ -473,6 +505,23 @@ class OpenClawOneBotBridge:
 
         return None
 
+    async def _download_image(self, url: str) -> tuple[bytes | None, str]:
+        assert self.session is not None
+        onebot_host = urlparse(self.cfg.onebot_http_base).netloc
+        headers: dict[str, str] = {"User-Agent": "Mozilla/5.0"}
+        if onebot_host and urlparse(url).netloc == onebot_host and self.cfg.onebot_access_token:
+            headers["Authorization"] = f"Bearer {self.cfg.onebot_access_token}"
+
+        try:
+            async with self.session.get(url, headers=headers) as resp:
+                if resp.status >= 400:
+                    return None, ""
+                body = await resp.read()
+                ctype = resp.headers.get("Content-Type", "")
+                return body, ctype
+        except Exception:  # noqa: BLE001
+            return None, ""
+
     @staticmethod
     def _guess_image_mime(url: str, file_name: str, content_type: str) -> str:
         if content_type:
@@ -492,16 +541,17 @@ class OpenClawOneBotBridge:
         out: list[dict[str, str]] = []
         max_count = max(1, self.cfg.max_image_attachments)
         max_bytes = max(1024 * 1024, self.cfg.max_image_download_bytes)
-        onebot_host = urlparse(self.cfg.onebot_http_base).netloc
-
         for img in images:
             if len(out) >= max_count:
                 break
             resolved = img
-            if (not resolved.url.strip()) and resolved.file.strip():
+            if resolved.file.strip():
+                # 优先使用 get_image 刷新 URL，避免旧 URL 失效。
                 got = await self._resolve_image_with_get_image(resolved.file.strip())
                 if got is not None:
                     resolved = got
+            elif not resolved.url.strip():
+                continue
 
             url = resolved.url.strip()
             if not (url.startswith("http://") or url.startswith("https://")):
@@ -510,33 +560,30 @@ class OpenClawOneBotBridge:
                 )
                 continue
 
-            headers: dict[str, str] | None = None
-            if onebot_host and urlparse(url).netloc == onebot_host and self.cfg.onebot_access_token:
-                headers = {"Authorization": f"Bearer {self.cfg.onebot_access_token}"}
-
             try:
-                async with self.session.get(url, headers=headers) as resp:
-                    if resp.status >= 400:
-                        logging.warning("Skip image %s: HTTP %s", url, resp.status)
-                        continue
-                    content = await resp.read()
-                    if not content:
-                        continue
-                    if len(content) > max_bytes:
-                        logging.warning(
-                            "Skip image too large (%s bytes): %s", len(content), url
-                        )
-                        continue
-                    mime_type = self._guess_image_mime(
-                        url, resolved.file, resp.headers.get("Content-Type", "")
-                    )
-                    out.append(
-                        {
-                            "type": "image",
-                            "mimeType": mime_type,
-                            "content": base64.b64encode(content).decode("ascii"),
-                        }
-                    )
+                content, ctype = await self._download_image(url)
+                if (not content) and resolved.file.strip():
+                    # URL 可能过期，再刷新一次并重试。
+                    refreshed = await self._resolve_image_with_get_image(resolved.file.strip())
+                    if refreshed and refreshed.url.strip() and refreshed.url.strip() != url:
+                        resolved = refreshed
+                        content, ctype = await self._download_image(resolved.url.strip())
+
+                if not content:
+                    logging.warning("Skip image download failed (file=%s url=%s)", resolved.file, url)
+                    continue
+                if len(content) > max_bytes:
+                    logging.warning("Skip image too large (%s bytes): %s", len(content), url)
+                    continue
+
+                mime_type = self._guess_image_mime(resolved.url.strip(), resolved.file, ctype)
+                out.append(
+                    {
+                        "type": "image",
+                        "mimeType": mime_type,
+                        "content": base64.b64encode(content).decode("ascii"),
+                    }
+                )
             except Exception as exc:  # noqa: BLE001
                 logging.warning("Failed to fetch image %s: %s", url, exc)
 
@@ -555,6 +602,137 @@ class OpenClawOneBotBridge:
         except json.JSONDecodeError:
             return None
         return None
+
+    async def _gateway_ws_request(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        method: str,
+        params: dict[str, Any],
+        timeout_sec: float = 15.0,
+    ) -> dict[str, Any]:
+        req_id = str(uuid.uuid4())
+        await ws.send_str(
+            json.dumps(
+                {"type": "req", "id": req_id, "method": method, "params": params},
+                ensure_ascii=False,
+            )
+        )
+        deadline = asyncio.get_running_loop().time() + timeout_sec
+        while True:
+            remaining = max(1.0, deadline - asyncio.get_running_loop().time())
+            packet = await self._ws_wait_text_json(ws, remaining)
+            if not packet:
+                continue
+            if packet.get("type") == "res" and packet.get("id") == req_id:
+                if packet.get("ok") is True:
+                    payload = packet.get("payload")
+                    return payload if isinstance(payload, dict) else {}
+                err = packet.get("error") or {}
+                raise RuntimeError(
+                    f"Gateway request {method} failed: {err.get('code')} {err.get('message')}"
+                )
+
+    async def _connect_gateway_for_probe(
+        self, ws_url: str
+    ) -> aiohttp.ClientWebSocketResponse:
+        assert self.session is not None
+        ws = await self.session.ws_connect(ws_url, heartbeat=20)
+        deadline = asyncio.get_running_loop().time() + 15.0
+        connect_req_id = str(uuid.uuid4())
+        while True:
+            remaining = max(1.0, deadline - asyncio.get_running_loop().time())
+            packet = await self._ws_wait_text_json(ws, remaining)
+            if not packet:
+                continue
+            if packet.get("type") == "event" and packet.get("event") == "connect.challenge":
+                req = {
+                    "type": "req",
+                    "id": connect_req_id,
+                    "method": "connect",
+                    "params": {
+                        "minProtocol": 3,
+                        "maxProtocol": 3,
+                        "client": {
+                            "id": self.cfg.openclaw_client_id,
+                            "version": "0.1.0",
+                            "platform": "linux",
+                            "mode": self.cfg.openclaw_client_mode,
+                        },
+                        "role": self.cfg.openclaw_role,
+                        "scopes": [s.strip() for s in self.cfg.openclaw_scopes.split(",") if s.strip()],
+                        "caps": [],
+                        "commands": [],
+                        "permissions": {},
+                        "auth": self._openclaw_auth_params(),
+                        "locale": "zh-CN",
+                        "userAgent": "llonebot-openclaw-bridge/0.1.0",
+                    },
+                }
+                await ws.send_str(json.dumps(req, ensure_ascii=False))
+                continue
+            if packet.get("type") == "res" and packet.get("id") == connect_req_id:
+                if packet.get("ok") is True:
+                    return ws
+                err = packet.get("error") or {}
+                await ws.close()
+                raise RuntimeError(f"Gateway connect failed: {err.get('code')} {err.get('message')}")
+
+    async def _detect_image_model_support(self) -> tuple[bool, str]:
+        now = time.time()
+        if self.image_support_cache_value is not None and now < self.image_support_cache_until:
+            return self.image_support_cache_value, self.image_support_model_desc
+
+        urls: list[str] = []
+        for item in [self.preferred_openclaw_ws_url, self.cfg.openclaw_ws_url, self.cfg.openclaw_ws_fallback_url]:
+            item = item.strip()
+            if item and item not in urls:
+                urls.append(item)
+
+        last_err: Exception | None = None
+        for url in urls:
+            ws: aiohttp.ClientWebSocketResponse | None = None
+            try:
+                ws = await self._connect_gateway_for_probe(url)
+                sessions = await self._gateway_ws_request(ws, "sessions.list", {})
+                defaults = sessions.get("defaults") or {}
+                model_provider = str(defaults.get("modelProvider", "")).strip()
+                model = str(defaults.get("model", "")).strip()
+                model_desc = f"{model_provider}/{model}" if model_provider and model else (model or "unknown")
+
+                models_payload = await self._gateway_ws_request(ws, "models.list", {})
+                models = models_payload.get("models") if isinstance(models_payload, dict) else []
+
+                supports_image = False
+                if isinstance(models, list):
+                    for item in models:
+                        if not isinstance(item, dict):
+                            continue
+                        pid = str(item.get("provider", "")).strip()
+                        mid = str(item.get("id", "")).strip()
+                        if model_provider and pid and model_provider != pid:
+                            continue
+                        # sessions.list 返回 model 是裸 id；models.list 里的 id 可能是全路径
+                        if model and not (mid == model or mid.endswith(f"/{model}")):
+                            continue
+                        inputs = item.get("input")
+                        if isinstance(inputs, list) and any(str(x).lower() == "image" for x in inputs):
+                            supports_image = True
+                            break
+
+                self.preferred_openclaw_ws_url = url
+                self.image_support_cache_value = supports_image
+                self.image_support_model_desc = model_desc
+                self.image_support_cache_until = now + max(30, self.cfg.image_model_probe_ttl_sec)
+                return supports_image, model_desc
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+            finally:
+                if ws is not None:
+                    await ws.close()
+
+        logging.warning("Image model capability probe failed: %s", last_err)
+        # 探测失败时不阻塞主流程，默认放行
+        return True, "unknown"
 
     async def _ask_openclaw_once(
         self,
@@ -633,6 +811,12 @@ class OpenClawOneBotBridge:
             }
             if attachments:
                 chat_req["params"]["attachments"] = attachments
+            logging.info(
+                "OpenClaw chat.send via=%s key=%s attachments=%s",
+                ws_url,
+                session_key,
+                len(attachments),
+            )
             await ws.send_str(json.dumps(chat_req, ensure_ascii=False))
 
             while not done:
@@ -678,7 +862,12 @@ class OpenClawOneBotBridge:
         self, session_key: str, user_text: str, attachments: list[dict[str, str]]
     ) -> str:
         urls: list[str] = []
-        for item in [self.cfg.openclaw_ws_url, self.cfg.openclaw_ws_fallback_url]:
+        ordered_sources = [
+            self.preferred_openclaw_ws_url,
+            self.cfg.openclaw_ws_url,
+            self.cfg.openclaw_ws_fallback_url,
+        ]
+        for item in ordered_sources:
             item = item.strip()
             if item and item not in urls:
                 urls.append(item)
@@ -686,7 +875,9 @@ class OpenClawOneBotBridge:
         last_err: Exception | None = None
         for url in urls:
             try:
-                return await self._ask_openclaw_once(url, session_key, user_text, attachments)
+                result = await self._ask_openclaw_once(url, session_key, user_text, attachments)
+                self.preferred_openclaw_ws_url = url
+                return result
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
                 logging.warning("OpenClaw connection via %s failed: %s", url, exc)
@@ -699,6 +890,7 @@ class OpenClawOneBotBridge:
         session_key: str,
         prompt_text: str,
         image_candidates: list[MessageImage],
+        latest_text: str,
     ) -> None:
         async with self.sem:
             logging.info(
@@ -712,7 +904,39 @@ class OpenClawOneBotBridge:
 
             try:
                 attachments = await self._build_image_attachments(image_candidates)
-                reply = await self._ask_openclaw(session_key, prompt_text, attachments)
+                logging.info(
+                    "Attachment build result: candidate_images=%s attachments=%s key=%s",
+                    len(image_candidates),
+                    len(attachments),
+                    session_key,
+                )
+
+                if attachments:
+                    supports_image, model_desc = await self._detect_image_model_support()
+                    if not supports_image:
+                        warn = (
+                            "图片已由桥接下载并准备上传，但 OpenClaw 当前默认模型不支持图像输入。\n"
+                            f"当前模型：`{model_desc}`\n\n"
+                            "请在 OpenClaw 中切换到支持 image 的模型后重试。"
+                        )
+                        await self._send_onebot_reply(event, warn)
+                        return
+
+                final_prompt = prompt_text
+                if attachments:
+                    visual_prefix = (
+                        f"你已收到 {len(attachments)} 张图片附件，必须基于附件内容回答，"
+                    )
+                    if self._is_image_only_text(latest_text):
+                        visual_suffix = (
+                            "\n用户这条消息是纯图片。请先输出：\n"
+                            "1) 图片内容描述\n2) OCR文字提取\n3) 关键信息总结"
+                        )
+                    else:
+                        visual_suffix = ""
+                    final_prompt = f"{visual_prefix}\n{prompt_text}{visual_suffix}"
+
+                reply = await self._ask_openclaw(session_key, final_prompt, attachments)
                 await self._send_onebot_reply(event, reply)
             except Exception as exc:  # noqa: BLE001
                 logging.exception("Bridge processing failed: %s", exc)
@@ -745,7 +969,13 @@ class OpenClawOneBotBridge:
         prompt_text = self._build_prompt_from_pending(pending, latest_text)
         image_candidates = self._collect_recent_images(pending)
         task = asyncio.create_task(
-            self._process_message(event, session_key, prompt_text, image_candidates)
+            self._process_message(
+                event,
+                session_key,
+                prompt_text,
+                image_candidates,
+                latest_text,
+            )
         )
         self.bg_tasks.add(task)
         task.add_done_callback(lambda t: self.bg_tasks.discard(t))
