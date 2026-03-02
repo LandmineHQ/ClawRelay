@@ -39,6 +39,10 @@ UV_CACHE_DIR=/storage/llonebot/.cache/uv uv run start
 - `GROUP_PREFIX`：群聊命令前缀，默认 `/ai`（可与@并存）
 - `GROUP_REPLY_AT_SENDER`：群聊回复时是否 @ 发送者，默认 `true`
 - `MAX_CONCURRENCY`：并发处理消息数，默认 `3`
+- `CONTEXT_OBSERVATION_LIMIT`：每会话保留的“待冲刷”观察消息数，默认 `30`
+- `CONTEXT_FLUSH_LIMIT`：触发回复时发送给 OpenClaw 的最近观察条数，默认 `12`
+- `MAX_IMAGE_ATTACHMENTS`：每次最多上传图片附件数，默认 `3`
+- `MAX_IMAGE_DOWNLOAD_BYTES`：单张图片下载上限（字节），默认 `6291456`
 
 ## 4. 触发规则
 
@@ -46,3 +50,5 @@ UV_CACHE_DIR=/storage/llonebot/.cache/uv uv run start
 - 群聊：满足以下任一条件会触发
   - `@机器人`
   - 以 `GROUP_PREFIX`（默认 `/ai`）开头
+- 群聊未触发时也会记录该用户消息到会话上下文，等下次触发时一并带入
+- 图片消息会尝试从 OneBot 图片 URL 下载并作为附件发给 OpenClaw

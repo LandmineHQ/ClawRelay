@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
 import os
 import re
 import uuid
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
+from datetime import datetime
+from html import unescape
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -55,6 +60,10 @@ class Config:
     reconnect_delay_sec: int = env_int("RECONNECT_DELAY_SEC", 3)
     max_reconnect_delay_sec: int = env_int("MAX_RECONNECT_DELAY_SEC", 30)
     max_concurrency: int = env_int("MAX_CONCURRENCY", 3)
+    context_observation_limit: int = env_int("CONTEXT_OBSERVATION_LIMIT", 30)
+    context_flush_limit: int = env_int("CONTEXT_FLUSH_LIMIT", 12)
+    max_image_attachments: int = env_int("MAX_IMAGE_ATTACHMENTS", 3)
+    max_image_download_bytes: int = env_int("MAX_IMAGE_DOWNLOAD_BYTES", 6 * 1024 * 1024)
 
     group_require_at: bool = env_bool("GROUP_REQUIRE_AT", True)
     group_prefix: str = os.getenv("GROUP_PREFIX", "/ai")
@@ -62,6 +71,27 @@ class Config:
 
     self_qq: str = os.getenv("BOT_SELF_QQ", "")
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
+
+
+@dataclass
+class MessageImage:
+    url: str
+    file: str
+
+
+@dataclass
+class ParsedMessage:
+    text: str
+    mentioned: bool
+    images: list[MessageImage]
+
+
+@dataclass
+class PendingObservation:
+    line: str
+    normalized_text: str
+    images: list[MessageImage]
+    ts: float
 
 
 class OpenClawOneBotBridge:
@@ -72,6 +102,9 @@ class OpenClawOneBotBridge:
         self.bg_tasks: set[asyncio.Task[Any]] = set()
         self.seen_ids: deque[str] = deque(maxlen=2000)
         self.seen_set: set[str] = set()
+        self.pending_context: dict[str, deque[PendingObservation]] = defaultdict(
+            lambda: deque(maxlen=max(2, self.cfg.context_observation_limit))
+        )
 
     def _onebot_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -115,68 +148,187 @@ class OpenClawOneBotBridge:
         self_id = event.get("self_id")
         return str(self_id) if self_id is not None else ""
 
-    def _extract_text_and_mention(self, event: dict[str, Any]) -> tuple[str, bool]:
+    @staticmethod
+    def _parse_cq_params(params_text: str) -> dict[str, str]:
+        out: dict[str, str] = {}
+        if not params_text.strip():
+            return out
+        for piece in params_text.split(","):
+            if "=" not in piece:
+                continue
+            key, value = piece.split("=", 1)
+            out[key.strip()] = unescape(value.strip())
+        return out
+
+    def _extract_message(self, event: dict[str, Any]) -> ParsedMessage:
         message = event.get("message")
         self_qq = self._get_self_qq(event)
         mentioned = False
-
-        if isinstance(message, str):
-            if self_qq:
-                at_token = f"[CQ:at,qq={self_qq}]"
-                if at_token in message:
-                    mentioned = True
-                message = message.replace(at_token, "")
-            message = re.sub(r"\[CQ:at,qq=\d+\]", "", message)
-            text = re.sub(r"\s+", " ", message).strip()
-            return text, mentioned
+        images: list[MessageImage] = []
 
         if isinstance(message, list):
-            parts: list[str] = []
+            text_parts: list[str] = []
             for seg in message:
                 if not isinstance(seg, dict):
                     continue
                 seg_type = seg.get("type")
                 data = seg.get("data") or {}
                 if seg_type == "text":
-                    parts.append(str(data.get("text", "")))
+                    text_parts.append(str(data.get("text", "")))
                 elif seg_type == "at":
                     qq = str(data.get("qq", ""))
                     if self_qq and qq == self_qq:
                         mentioned = True
-            return "".join(parts).strip(), mentioned
+                elif seg_type == "image":
+                    url = str(data.get("url", "")).strip()
+                    file = str(data.get("file", "")).strip()
+                    images.append(MessageImage(url=url, file=file))
+                    text_parts.append("[图片]")
+            text = re.sub(r"\s+", " ", "".join(text_parts)).strip()
+            return ParsedMessage(text=text, mentioned=mentioned, images=images)
 
-        return "", False
+        if isinstance(message, str):
+            text_parts: list[str] = []
+            last = 0
+            for matched in re.finditer(r"\[CQ:([a-zA-Z0-9_]+)(?:,([^\]]*))?\]", message):
+                text_parts.append(message[last : matched.start()])
+                last = matched.end()
+                cq_type = matched.group(1)
+                params = self._parse_cq_params(matched.group(2) or "")
+                if cq_type == "at":
+                    qq = params.get("qq", "")
+                    if self_qq and qq == self_qq:
+                        mentioned = True
+                    continue
+                if cq_type == "image":
+                    images.append(
+                        MessageImage(
+                            url=params.get("url", "").strip(),
+                            file=params.get("file", "").strip(),
+                        )
+                    )
+                    text_parts.append("[图片]")
+            text_parts.append(message[last:])
+            merged = "".join(text_parts)
 
-    def _should_process(
-        self, event: dict[str, Any], text: str, mentioned: bool
-    ) -> tuple[bool, str]:
+            # llonebot 部分场景会把图片渲染成 [图片]filename.ext
+            for img_name in re.findall(
+                r"\[图片\]\s*([A-Za-z0-9._-]+\.(?:png|jpg|jpeg|gif|webp|bmp))",
+                merged,
+                flags=re.IGNORECASE,
+            ):
+                images.append(MessageImage(url="", file=img_name.strip()))
+
+            text = re.sub(r"\s+", " ", merged).strip()
+            return ParsedMessage(text=text, mentioned=mentioned, images=images)
+
+        return ParsedMessage(text="", mentioned=False, images=[])
+
+    @staticmethod
+    def _sender_name(event: dict[str, Any]) -> str:
+        sender = event.get("sender") or {}
+        if isinstance(sender, dict):
+            card = str(sender.get("card", "")).strip()
+            nickname = str(sender.get("nickname", "")).strip()
+            if card:
+                return card
+            if nickname:
+                return nickname
+        return str(event.get("user_id", "unknown"))
+
+    @staticmethod
+    def _format_observation_line(
+        sender_name: str, normalized_text: str, images: list[MessageImage], ts: float
+    ) -> str:
+        display = normalized_text or "（无文本）"
+        if images:
+            refs = [img.url or img.file or "unknown" for img in images]
+            display = f"{display} | 图片: {', '.join(refs)}"
+        time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+        return f"{time_str} {sender_name}: {display}"
+
+    def _record_observation(
+        self, event: dict[str, Any], session_key: str, normalized_text: str, images: list[MessageImage]
+    ) -> None:
+        sender_name = self._sender_name(event)
+        ts_raw = event.get("time")
+        try:
+            ts = float(ts_raw) if ts_raw is not None else datetime.now().timestamp()
+        except (TypeError, ValueError):
+            ts = datetime.now().timestamp()
+        line = self._format_observation_line(sender_name, normalized_text, images, ts)
+        self.pending_context[session_key].append(
+            PendingObservation(
+                line=line,
+                normalized_text=normalized_text,
+                images=list(images),
+                ts=ts,
+            )
+        )
+
+    def _should_process_event(self, event: dict[str, Any]) -> bool:
         if event.get("post_type") != "message":
-            return False, text
+            return False
 
         message_type = event.get("message_type")
         if message_type not in {"private", "group"}:
-            return False, text
+            return False
 
         user_id = event.get("user_id")
         self_id = event.get("self_id")
         if user_id is not None and self_id is not None and str(user_id) == str(self_id):
-            return False, text
+            return False
+        return True
 
-        if not text.strip():
-            return False, text
+    def _should_reply(
+        self, event: dict[str, Any], parsed: ParsedMessage
+    ) -> tuple[bool, str]:
+        message_type = event.get("message_type")
+        raw = parsed.text.strip()
+        has_content = bool(raw or parsed.images)
+        if not has_content:
+            return False, ""
 
         if message_type == "private":
-            return True, text.strip()
+            return True, raw
 
         prefix = self.cfg.group_prefix.strip()
-        if prefix and text.startswith(prefix):
-            stripped = text[len(prefix) :].strip()
-            return bool(stripped), stripped
+        if prefix and raw.startswith(prefix):
+            stripped = raw[len(prefix) :].strip()
+            if stripped or parsed.images:
+                return True, stripped
 
-        if self.cfg.group_require_at and not mentioned:
-            return False, text
+        if self.cfg.group_require_at and not parsed.mentioned:
+            return False, raw
 
-        return True, text.strip()
+        return True, raw
+
+    def _build_prompt_from_pending(
+        self, pending: list[PendingObservation], latest_text: str
+    ) -> str:
+        recent = pending[-max(1, self.cfg.context_flush_limit) :]
+        context_lines = [f"{i + 1}. {item.line}" for i, item in enumerate(recent)]
+        latest = latest_text.strip() or "（用户发送了图片）"
+        return (
+            "下面是同一会话近期消息记录（按时间顺序）：\n"
+            + "\n".join(context_lines)
+            + "\n\n请结合以上记录，回复最后一条来自用户的消息。\n"
+            + f"最后一条消息：{latest}"
+        )
+
+    def _collect_recent_images(self, pending: list[PendingObservation]) -> list[MessageImage]:
+        out: list[MessageImage] = []
+        seen: set[str] = set()
+        for obs in reversed(pending):
+            for img in obs.images:
+                key = f"{img.url}|{img.file}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(img)
+                if len(out) >= max(1, self.cfg.max_image_attachments):
+                    return out
+        return out
 
     def _mark_seen(self, message_id: Any) -> bool:
         if message_id is None:
@@ -224,6 +376,64 @@ class OpenClawOneBotBridge:
             if data.get("status") != "ok" and data.get("retcode") not in (0, None):
                 raise RuntimeError(f"OneBot send failed: {data}")
 
+    @staticmethod
+    def _guess_image_mime(url: str, file_name: str, content_type: str) -> str:
+        if content_type:
+            lowered = content_type.split(";", 1)[0].strip().lower()
+            if lowered.startswith("image/"):
+                return lowered
+        guessed = mimetypes.guess_type(url or file_name)[0]
+        if guessed and guessed.startswith("image/"):
+            return guessed
+        return "image/jpeg"
+
+    async def _build_image_attachments(self, images: list[MessageImage]) -> list[dict[str, str]]:
+        assert self.session is not None
+        if not images:
+            return []
+
+        out: list[dict[str, str]] = []
+        max_count = max(1, self.cfg.max_image_attachments)
+        max_bytes = max(1024 * 1024, self.cfg.max_image_download_bytes)
+        onebot_host = urlparse(self.cfg.onebot_http_base).netloc
+
+        for img in images:
+            if len(out) >= max_count:
+                break
+            url = img.url.strip()
+            if not (url.startswith("http://") or url.startswith("https://")):
+                continue
+
+            headers: dict[str, str] | None = None
+            if onebot_host and urlparse(url).netloc == onebot_host and self.cfg.onebot_access_token:
+                headers = {"Authorization": f"Bearer {self.cfg.onebot_access_token}"}
+
+            try:
+                async with self.session.get(url, headers=headers) as resp:
+                    if resp.status >= 400:
+                        logging.warning("Skip image %s: HTTP %s", url, resp.status)
+                        continue
+                    content = await resp.read()
+                    if not content:
+                        continue
+                    if len(content) > max_bytes:
+                        logging.warning(
+                            "Skip image too large (%s bytes): %s", len(content), url
+                        )
+                        continue
+                    mime_type = self._guess_image_mime(url, img.file, resp.headers.get("Content-Type", ""))
+                    out.append(
+                        {
+                            "type": "image",
+                            "mimeType": mime_type,
+                            "content": base64.b64encode(content).decode("ascii"),
+                        }
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Failed to fetch image %s: %s", url, exc)
+
+        return out
+
     async def _ws_wait_text_json(
         self, ws: aiohttp.ClientWebSocketResponse, timeout_sec: float
     ) -> dict[str, Any] | None:
@@ -238,7 +448,13 @@ class OpenClawOneBotBridge:
             return None
         return None
 
-    async def _ask_openclaw_once(self, ws_url: str, session_key: str, user_text: str) -> str:
+    async def _ask_openclaw_once(
+        self,
+        ws_url: str,
+        session_key: str,
+        user_text: str,
+        attachments: list[dict[str, str]],
+    ) -> str:
         assert self.session is not None
         timeout = float(self.cfg.openclaw_timeout_sec)
 
@@ -307,6 +523,8 @@ class OpenClawOneBotBridge:
                     "idempotencyKey": str(uuid.uuid4()),
                 },
             }
+            if attachments:
+                chat_req["params"]["attachments"] = attachments
             await ws.send_str(json.dumps(chat_req, ensure_ascii=False))
 
             while not done:
@@ -348,7 +566,9 @@ class OpenClawOneBotBridge:
                 return latest_text
             return "我暂时没有收到有效回复，请稍后再试。"
 
-    async def _ask_openclaw(self, session_key: str, user_text: str) -> str:
+    async def _ask_openclaw(
+        self, session_key: str, user_text: str, attachments: list[dict[str, str]]
+    ) -> str:
         urls: list[str] = []
         for item in [self.cfg.openclaw_ws_url, self.cfg.openclaw_ws_fallback_url]:
             item = item.strip()
@@ -358,26 +578,33 @@ class OpenClawOneBotBridge:
         last_err: Exception | None = None
         for url in urls:
             try:
-                return await self._ask_openclaw_once(url, session_key, user_text)
+                return await self._ask_openclaw_once(url, session_key, user_text, attachments)
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
                 logging.warning("OpenClaw connection via %s failed: %s", url, exc)
 
         raise RuntimeError(f"OpenClaw unavailable: {last_err}")
 
-    async def _process_message(self, event: dict[str, Any], text: str) -> None:
+    async def _process_message(
+        self,
+        event: dict[str, Any],
+        session_key: str,
+        prompt_text: str,
+        image_candidates: list[MessageImage],
+    ) -> None:
         async with self.sem:
-            session_key = self._build_session_key(event)
             logging.info(
-                "Processing message user=%s group=%s key=%s text=%s",
+                "Processing message user=%s group=%s key=%s text=%s images=%s",
                 event.get("user_id"),
                 event.get("group_id"),
                 session_key,
-                text,
+                prompt_text[:120],
+                len(image_candidates),
             )
 
             try:
-                reply = await self._ask_openclaw(session_key, text)
+                attachments = await self._build_image_attachments(image_candidates)
+                reply = await self._ask_openclaw(session_key, prompt_text, attachments)
                 await self._send_onebot_reply(event, reply)
             except Exception as exc:  # noqa: BLE001
                 logging.exception("Bridge processing failed: %s", exc)
@@ -391,12 +618,26 @@ class OpenClawOneBotBridge:
         if not self._mark_seen(message_id):
             return
 
-        text, mentioned = self._extract_text_and_mention(event)
-        should_process, normalized_text = self._should_process(event, text, mentioned)
-        if not should_process or not normalized_text:
+        if not self._should_process_event(event):
             return
 
-        task = asyncio.create_task(self._process_message(event, normalized_text))
+        session_key = self._build_session_key(event)
+        parsed = self._extract_message(event)
+        normalized_text = parsed.text.strip()
+        self._record_observation(event, session_key, normalized_text, parsed.images)
+
+        should_reply, latest_text = self._should_reply(event, parsed)
+        if not should_reply:
+            return
+
+        pending = list(self.pending_context[session_key])
+        self.pending_context[session_key].clear()
+
+        prompt_text = self._build_prompt_from_pending(pending, latest_text)
+        image_candidates = self._collect_recent_images(pending)
+        task = asyncio.create_task(
+            self._process_message(event, session_key, prompt_text, image_candidates)
+        )
         self.bg_tasks.add(task)
         task.add_done_callback(lambda t: self.bg_tasks.discard(t))
 
