@@ -160,15 +160,27 @@ class OpenClawOneBotBridge:
             out[key.strip()] = unescape(value.strip())
         return out
 
-    def _extract_message(self, event: dict[str, Any]) -> ParsedMessage:
-        message = event.get("message")
-        self_qq = self._get_self_qq(event)
+    @staticmethod
+    def _merge_images(primary: list[MessageImage], secondary: list[MessageImage]) -> list[MessageImage]:
+        merged: list[MessageImage] = []
+        seen: set[str] = set()
+        for img in [*primary, *secondary]:
+            key = f"{img.url}|{img.file}"
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(img)
+        return merged
+
+    def _extract_message_from_payload(
+        self, payload: Any, self_qq: str
+    ) -> ParsedMessage:
         mentioned = False
         images: list[MessageImage] = []
 
-        if isinstance(message, list):
+        if isinstance(payload, list):
             text_parts: list[str] = []
-            for seg in message:
+            for seg in payload:
                 if not isinstance(seg, dict):
                     continue
                 seg_type = seg.get("type")
@@ -187,11 +199,11 @@ class OpenClawOneBotBridge:
             text = re.sub(r"\s+", " ", "".join(text_parts)).strip()
             return ParsedMessage(text=text, mentioned=mentioned, images=images)
 
-        if isinstance(message, str):
+        if isinstance(payload, str):
             text_parts: list[str] = []
             last = 0
-            for matched in re.finditer(r"\[CQ:([a-zA-Z0-9_]+)(?:,([^\]]*))?\]", message):
-                text_parts.append(message[last : matched.start()])
+            for matched in re.finditer(r"\[CQ:([a-zA-Z0-9_]+)(?:,([^\]]*))?\]", payload):
+                text_parts.append(payload[last : matched.start()])
                 last = matched.end()
                 cq_type = matched.group(1)
                 params = self._parse_cq_params(matched.group(2) or "")
@@ -208,7 +220,7 @@ class OpenClawOneBotBridge:
                         )
                     )
                     text_parts.append("[图片]")
-            text_parts.append(message[last:])
+            text_parts.append(payload[last:])
             merged = "".join(text_parts)
 
             # llonebot 部分场景会把图片渲染成 [图片]filename.ext
@@ -223,6 +235,18 @@ class OpenClawOneBotBridge:
             return ParsedMessage(text=text, mentioned=mentioned, images=images)
 
         return ParsedMessage(text="", mentioned=False, images=[])
+
+    def _extract_message(self, event: dict[str, Any]) -> ParsedMessage:
+        self_qq = self._get_self_qq(event)
+        parsed_main = self._extract_message_from_payload(event.get("message"), self_qq)
+        parsed_raw = self._extract_message_from_payload(event.get("raw_message"), self_qq)
+        merged_images = self._merge_images(parsed_main.images, parsed_raw.images)
+        text = parsed_main.text or parsed_raw.text
+        return ParsedMessage(
+            text=text,
+            mentioned=parsed_main.mentioned or parsed_raw.mentioned,
+            images=merged_images,
+        )
 
     @staticmethod
     def _sender_name(event: dict[str, Any]) -> str:
@@ -376,6 +400,79 @@ class OpenClawOneBotBridge:
             if data.get("status") != "ok" and data.get("retcode") not in (0, None):
                 raise RuntimeError(f"OneBot send failed: {data}")
 
+    async def _onebot_action(self, action: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        assert self.session is not None
+        url = f"{self.cfg.onebot_http_base.rstrip('/')}/{action}"
+        try:
+            async with self.session.post(
+                url,
+                headers=self._onebot_headers(),
+                json=payload,
+            ) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    logging.warning("OneBot action %s HTTP %s: %s", action, resp.status, text[:200])
+                    return None
+                data = json.loads(text)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("OneBot action %s failed: %s", action, exc)
+            return None
+
+        if data.get("status") != "ok" and data.get("retcode") not in (0, None):
+            logging.warning("OneBot action %s retcode failed: %s", action, data)
+            return None
+        result = data.get("data")
+        return result if isinstance(result, dict) else {}
+
+    async def _augment_parsed_message(self, event: dict[str, Any], parsed: ParsedMessage) -> ParsedMessage:
+        # 当 message 只呈现为 “[图片]xxx.png” 时，补查 get_msg 还原标准消息段。
+        message_id = event.get("message_id")
+        if message_id is None:
+            return parsed
+
+        needs_augment = (not parsed.images) or any((not img.url and img.file) for img in parsed.images)
+        if not needs_augment:
+            return parsed
+
+        extra = await self._onebot_action("get_msg", {"message_id": message_id})
+        if not extra:
+            return parsed
+
+        self_qq = self._get_self_qq(event)
+        parsed_from_msg = self._extract_message_from_payload(extra.get("message"), self_qq)
+        parsed_from_raw = self._extract_message_from_payload(extra.get("raw_message"), self_qq)
+        images = self._merge_images(parsed.images, parsed_from_msg.images)
+        images = self._merge_images(images, parsed_from_raw.images)
+        text = parsed.text or parsed_from_msg.text or parsed_from_raw.text
+        return ParsedMessage(
+            text=text,
+            mentioned=parsed.mentioned or parsed_from_msg.mentioned or parsed_from_raw.mentioned,
+            images=images,
+        )
+
+    async def _resolve_image_with_get_image(self, file_id: str) -> MessageImage | None:
+        # OneBot v11: /get_image(file) -> { file, url, file_name, ... }
+        candidates = [file_id]
+        if file_id:
+            lower = file_id.lower()
+            upper = file_id.upper()
+            if lower not in candidates:
+                candidates.append(lower)
+            if upper not in candidates:
+                candidates.append(upper)
+
+        for cand in candidates:
+            data = await self._onebot_action("get_image", {"file": cand})
+            if not data:
+                continue
+            url = str(data.get("url", "")).strip()
+            file_name = str(data.get("file_name", "") or data.get("filename", "")).strip()
+            local_file = str(data.get("file", "")).strip()
+            merged_file = file_name or cand or local_file
+            return MessageImage(url=url, file=merged_file)
+
+        return None
+
     @staticmethod
     def _guess_image_mime(url: str, file_name: str, content_type: str) -> str:
         if content_type:
@@ -400,8 +497,17 @@ class OpenClawOneBotBridge:
         for img in images:
             if len(out) >= max_count:
                 break
-            url = img.url.strip()
+            resolved = img
+            if (not resolved.url.strip()) and resolved.file.strip():
+                got = await self._resolve_image_with_get_image(resolved.file.strip())
+                if got is not None:
+                    resolved = got
+
+            url = resolved.url.strip()
             if not (url.startswith("http://") or url.startswith("https://")):
+                logging.warning(
+                    "Skip image without downloadable url (file=%s)", resolved.file or img.file
+                )
                 continue
 
             headers: dict[str, str] | None = None
@@ -421,7 +527,9 @@ class OpenClawOneBotBridge:
                             "Skip image too large (%s bytes): %s", len(content), url
                         )
                         continue
-                    mime_type = self._guess_image_mime(url, img.file, resp.headers.get("Content-Type", ""))
+                    mime_type = self._guess_image_mime(
+                        url, resolved.file, resp.headers.get("Content-Type", "")
+                    )
                     out.append(
                         {
                             "type": "image",
@@ -623,6 +731,7 @@ class OpenClawOneBotBridge:
 
         session_key = self._build_session_key(event)
         parsed = self._extract_message(event)
+        parsed = await self._augment_parsed_message(event, parsed)
         normalized_text = parsed.text.strip()
         self._record_observation(event, session_key, normalized_text, parsed.images)
 

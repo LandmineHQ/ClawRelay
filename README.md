@@ -52,3 +52,4 @@ UV_CACHE_DIR=/storage/llonebot/.cache/uv uv run start
   - 以 `GROUP_PREFIX`（默认 `/ai`）开头
 - 群聊未触发时也会记录该用户消息到会话上下文，等下次触发时一并带入
 - 图片消息会尝试从 OneBot 图片 URL 下载并作为附件发给 OpenClaw
+- 当消息里只有图片文件名（无 URL）时，会按 OneBot v11 调用 `get_msg` / `get_image` 补全图片信息
