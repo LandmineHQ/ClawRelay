@@ -57,5 +57,4 @@ UV_CACHE_DIR=/storage/llonebot/.cache/uv uv run start
 - 图片消息会尝试从 OneBot 图片 URL 下载并作为附件发给 OpenClaw
 - 当消息里只有图片文件名（无 URL）时，会按 OneBot v11 调用 `get_msg` / `get_image` 补全图片信息
 - 会话文本中图片会标记为 `[图片:文件哈希]`，避免多张图都只显示 `[图片]`
-- 若桥接检测到 OpenClaw 当前默认模型不支持 `image` 输入，会直接提示切换模型（避免“已发图却被当成没图”）
-- 若模型不支持图片，会尝试使用 OneBot `ocr_image` 进行 OCR 降级，再把 OCR 文本发给 OpenClaw
+- 若桥接检测到 OpenClaw 当前默认模型不支持 `image` 输入，会在回复前增加一行提示并忽略图片附件

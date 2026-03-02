@@ -442,10 +442,6 @@ class OpenClawOneBotBridge:
             + f"最后一条消息：{latest}"
         )
 
-    @staticmethod
-    def _is_image_only_text(text: str) -> bool:
-        return bool(re.fullmatch(r"\s*(?:\[图片:[^\]]+\]\s*)+", text or ""))
-
     def _collect_recent_images(self, pending: list[PendingObservation]) -> list[MessageImage]:
         out: list[MessageImage] = []
         seen: set[str] = set()
@@ -587,49 +583,6 @@ class OpenClawOneBotBridge:
             if data:
                 return data
         return None
-
-    @staticmethod
-    def _extract_ocr_text(data: dict[str, Any]) -> str:
-        if not data:
-            return ""
-        if isinstance(data.get("text"), str):
-            return data["text"].strip()
-        lines: list[str] = []
-        for key in ("texts", "result", "results"):
-            arr = data.get(key)
-            if not isinstance(arr, list):
-                continue
-            for item in arr:
-                if isinstance(item, str):
-                    val = item.strip()
-                elif isinstance(item, dict):
-                    val = str(item.get("text", "")).strip()
-                else:
-                    val = ""
-                if val:
-                    lines.append(val)
-        return "\n".join(lines).strip()
-
-    async def _onebot_ocr_fallback(self, images: list[MessageImage]) -> str:
-        # OneBot OCR 作为降级路径，短超时，避免卡住主流程。
-        outputs: list[str] = []
-        for img in images[: max(1, self.cfg.max_image_attachments)]:
-            file_id = img.file.strip()
-            if not file_id:
-                continue
-            info = await self._onebot_get_image_info(file_id)
-            if not info:
-                continue
-            refs = [str(info.get("file", "")).strip(), str(info.get("url", "")).strip()]
-            for ref in refs:
-                if not ref:
-                    continue
-                data = await self._onebot_action("ocr_image", {"image": ref}, timeout_sec=10)
-                text = self._extract_ocr_text(data or {})
-                if text:
-                    outputs.append(f"[{file_id}]\n{text}")
-                    break
-        return "\n\n".join(outputs).strip()
 
     async def _download_image(self, url: str) -> tuple[bytes | None, str]:
         assert self.session is not None
@@ -1016,7 +969,6 @@ class OpenClawOneBotBridge:
         session_key: str,
         prompt_text: str,
         image_candidates: list[MessageImage],
-        latest_text: str,
     ) -> None:
         async with self.sem:
             logging.info(
@@ -1040,44 +992,12 @@ class OpenClawOneBotBridge:
                 if attachments:
                     supports_image, model_desc = await self._detect_image_model_support()
                     if not supports_image:
-                        ocr_text = await self._onebot_ocr_fallback(image_candidates)
-                        if ocr_text:
-                            ocr_prompt = (
-                                "当前模型不支持直接图像输入。以下是桥接通过 OneBot OCR 提取的文字，"
-                                "请基于 OCR 结果和上下文进行回答；若 OCR 可能不完整请明确说明。\n\n"
-                                f"{prompt_text}\n\n"
-                                f"OCR结果：\n{ocr_text}"
-                            )
-                            reply = await self._ask_openclaw(session_key, ocr_prompt, [])
-                            await self._send_onebot_reply(event, reply)
-                            return
-
-                        warn = (
-                            "图片已由桥接下载并上传到 OpenClaw，但当前默认模型不支持图像输入，"
-                            "且 OneBot OCR 降级未成功。\n"
-                            f"当前模型：`{model_desc}`\n\n"
-                            "可选方案：\n"
-                            "1) 切换到支持 image 的模型\n"
-                            "2) 发送图片中的文字内容，我继续处理"
-                        )
-                        await self._send_onebot_reply(event, warn)
+                        reply = await self._ask_openclaw(session_key, prompt_text, [])
+                        hint = f"【提示】当前模型不支持 image 输入（{model_desc}），已忽略图片附件。"
+                        await self._send_onebot_reply(event, f"{hint}\n{reply}")
                         return
 
-                final_prompt = prompt_text
-                if attachments:
-                    visual_prefix = (
-                        f"你已收到 {len(attachments)} 张图片附件，必须基于附件内容回答，"
-                    )
-                    if self._is_image_only_text(latest_text):
-                        visual_suffix = (
-                            "\n用户这条消息是纯图片。请先输出：\n"
-                            "1) 图片内容描述\n2) OCR文字提取\n3) 关键信息总结"
-                        )
-                    else:
-                        visual_suffix = ""
-                    final_prompt = f"{visual_prefix}\n{prompt_text}{visual_suffix}"
-
-                reply = await self._ask_openclaw(session_key, final_prompt, attachments)
+                reply = await self._ask_openclaw(session_key, prompt_text, attachments)
                 await self._send_onebot_reply(event, reply)
             except Exception as exc:  # noqa: BLE001
                 logging.exception("Bridge processing failed: %s", exc)
@@ -1120,7 +1040,6 @@ class OpenClawOneBotBridge:
                 session_key,
                 prompt_text,
                 image_candidates,
-                latest_text,
             )
         )
         self.bg_tasks.add(task)
