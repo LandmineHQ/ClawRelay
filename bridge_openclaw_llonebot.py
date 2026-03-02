@@ -126,6 +126,9 @@ class OpenClawOneBotBridge:
             auth["password"] = self.cfg.openclaw_gateway_password
         return auth
 
+    def _scopes_list(self) -> list[str]:
+        return [s.strip() for s in self.cfg.openclaw_scopes.split(",") if s.strip()]
+
     @staticmethod
     def _extract_text_from_content(content: Any) -> str:
         if isinstance(content, str):
@@ -355,6 +358,77 @@ class OpenClawOneBotBridge:
 
         return True, raw
 
+    @staticmethod
+    def _detect_local_command(text: str, images: list[MessageImage]) -> str | None:
+        if images:
+            return None
+        stripped = (text or "").strip().lower()
+        if stripped in {"/new", "/help"}:
+            return stripped
+        return None
+
+    @staticmethod
+    def _help_text() -> str:
+        return (
+            "可用指令：\n"
+            "1) `/new`：重置当前会话上下文（开启新会话）\n"
+            "2) `/help`：查看指令说明"
+        )
+
+    def _openclaw_full_session_key(self, session_key: str) -> str:
+        if session_key.startswith("agent:"):
+            return session_key
+        return f"agent:main:{session_key}"
+
+    async def _reset_openclaw_session(self, session_key: str) -> tuple[bool, str]:
+        scopes = self._scopes_list()
+        if "operator.admin" not in scopes:
+            scopes = [*scopes, "operator.admin"]
+
+        urls: list[str] = []
+        for item in [self.preferred_openclaw_ws_url, self.cfg.openclaw_ws_url, self.cfg.openclaw_ws_fallback_url]:
+            item = item.strip()
+            if item and item not in urls:
+                urls.append(item)
+
+        full_key = self._openclaw_full_session_key(session_key)
+        last_err: Exception | None = None
+
+        for url in urls:
+            ws: aiohttp.ClientWebSocketResponse | None = None
+            try:
+                ws = await self._connect_gateway_for_probe(url, scopes=scopes)
+                await self._gateway_ws_request(ws, "sessions.reset", {"key": full_key})
+                self.preferred_openclaw_ws_url = url
+                return True, ""
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+            finally:
+                if ws is not None:
+                    await ws.close()
+
+        return False, str(last_err) if last_err else "unknown error"
+
+    async def _handle_local_command(
+        self, event: dict[str, Any], session_key: str, command: str
+    ) -> None:
+        cmd = command.strip().lower()
+        if cmd == "/help":
+            await self._send_onebot_reply(event, self._help_text())
+            return
+
+        if cmd == "/new":
+            # 清除桥接侧暂存上下文，并重置 OpenClaw 会话。
+            self.pending_context[session_key].clear()
+            ok, err = await self._reset_openclaw_session(session_key)
+            if ok:
+                await self._send_onebot_reply(event, "已重置当前会话。")
+            else:
+                await self._send_onebot_reply(
+                    event,
+                    f"会话重置失败：{err}\n请检查 OpenClaw token/scopes（需要 operator.admin）。",
+                )
+
     def _build_prompt_from_pending(
         self, pending: list[PendingObservation], latest_text: str
     ) -> str:
@@ -432,7 +506,9 @@ class OpenClawOneBotBridge:
             if data.get("status") != "ok" and data.get("retcode") not in (0, None):
                 raise RuntimeError(f"OneBot send failed: {data}")
 
-    async def _onebot_action(self, action: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    async def _onebot_action(
+        self, action: str, payload: dict[str, Any], timeout_sec: float | None = None
+    ) -> dict[str, Any] | None:
         assert self.session is not None
         url = f"{self.cfg.onebot_http_base.rstrip('/')}/{action}"
         try:
@@ -440,6 +516,7 @@ class OpenClawOneBotBridge:
                 url,
                 headers=self._onebot_headers(),
                 json=payload,
+                timeout=aiohttp.ClientTimeout(total=timeout_sec) if timeout_sec else None,
             ) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
@@ -458,6 +535,8 @@ class OpenClawOneBotBridge:
 
     async def _augment_parsed_message(self, event: dict[str, Any], parsed: ParsedMessage) -> ParsedMessage:
         # 当 message 只呈现为 “[图片]xxx.png” 时，补查 get_msg 还原标准消息段。
+        if self.session is None:
+            return parsed
         message_id = event.get("message_id")
         if message_id is None:
             return parsed
@@ -484,6 +563,17 @@ class OpenClawOneBotBridge:
 
     async def _resolve_image_with_get_image(self, file_id: str) -> MessageImage | None:
         # OneBot v11: /get_image(file) -> { file, url, file_name, ... }
+        data = await self._onebot_get_image_info(file_id)
+        if data:
+            url = str(data.get("url", "")).strip()
+            file_name = str(data.get("file_name", "") or data.get("filename", "")).strip()
+            local_file = str(data.get("file", "")).strip()
+            merged_file = file_name or file_id or local_file
+            return MessageImage(url=url, file=merged_file)
+
+        return None
+
+    async def _onebot_get_image_info(self, file_id: str) -> dict[str, Any] | None:
         candidates = [file_id]
         if file_id:
             lower = file_id.lower()
@@ -492,18 +582,54 @@ class OpenClawOneBotBridge:
                 candidates.append(lower)
             if upper not in candidates:
                 candidates.append(upper)
-
         for cand in candidates:
-            data = await self._onebot_action("get_image", {"file": cand})
-            if not data:
-                continue
-            url = str(data.get("url", "")).strip()
-            file_name = str(data.get("file_name", "") or data.get("filename", "")).strip()
-            local_file = str(data.get("file", "")).strip()
-            merged_file = file_name or cand or local_file
-            return MessageImage(url=url, file=merged_file)
-
+            data = await self._onebot_action("get_image", {"file": cand}, timeout_sec=8)
+            if data:
+                return data
         return None
+
+    @staticmethod
+    def _extract_ocr_text(data: dict[str, Any]) -> str:
+        if not data:
+            return ""
+        if isinstance(data.get("text"), str):
+            return data["text"].strip()
+        lines: list[str] = []
+        for key in ("texts", "result", "results"):
+            arr = data.get(key)
+            if not isinstance(arr, list):
+                continue
+            for item in arr:
+                if isinstance(item, str):
+                    val = item.strip()
+                elif isinstance(item, dict):
+                    val = str(item.get("text", "")).strip()
+                else:
+                    val = ""
+                if val:
+                    lines.append(val)
+        return "\n".join(lines).strip()
+
+    async def _onebot_ocr_fallback(self, images: list[MessageImage]) -> str:
+        # OneBot OCR 作为降级路径，短超时，避免卡住主流程。
+        outputs: list[str] = []
+        for img in images[: max(1, self.cfg.max_image_attachments)]:
+            file_id = img.file.strip()
+            if not file_id:
+                continue
+            info = await self._onebot_get_image_info(file_id)
+            if not info:
+                continue
+            refs = [str(info.get("file", "")).strip(), str(info.get("url", "")).strip()]
+            for ref in refs:
+                if not ref:
+                    continue
+                data = await self._onebot_action("ocr_image", {"image": ref}, timeout_sec=10)
+                text = self._extract_ocr_text(data or {})
+                if text:
+                    outputs.append(f"[{file_id}]\n{text}")
+                    break
+        return "\n\n".join(outputs).strip()
 
     async def _download_image(self, url: str) -> tuple[bytes | None, str]:
         assert self.session is not None
@@ -633,7 +759,7 @@ class OpenClawOneBotBridge:
                 )
 
     async def _connect_gateway_for_probe(
-        self, ws_url: str
+        self, ws_url: str, scopes: list[str] | None = None
     ) -> aiohttp.ClientWebSocketResponse:
         assert self.session is not None
         ws = await self.session.ws_connect(ws_url, heartbeat=20)
@@ -659,7 +785,7 @@ class OpenClawOneBotBridge:
                             "mode": self.cfg.openclaw_client_mode,
                         },
                         "role": self.cfg.openclaw_role,
-                        "scopes": [s.strip() for s in self.cfg.openclaw_scopes.split(",") if s.strip()],
+                        "scopes": scopes if scopes is not None else self._scopes_list(),
                         "caps": [],
                         "commands": [],
                         "permissions": {},
@@ -914,10 +1040,25 @@ class OpenClawOneBotBridge:
                 if attachments:
                     supports_image, model_desc = await self._detect_image_model_support()
                     if not supports_image:
+                        ocr_text = await self._onebot_ocr_fallback(image_candidates)
+                        if ocr_text:
+                            ocr_prompt = (
+                                "当前模型不支持直接图像输入。以下是桥接通过 OneBot OCR 提取的文字，"
+                                "请基于 OCR 结果和上下文进行回答；若 OCR 可能不完整请明确说明。\n\n"
+                                f"{prompt_text}\n\n"
+                                f"OCR结果：\n{ocr_text}"
+                            )
+                            reply = await self._ask_openclaw(session_key, ocr_prompt, [])
+                            await self._send_onebot_reply(event, reply)
+                            return
+
                         warn = (
-                            "图片已由桥接下载并准备上传，但 OpenClaw 当前默认模型不支持图像输入。\n"
+                            "图片已由桥接下载并上传到 OpenClaw，但当前默认模型不支持图像输入，"
+                            "且 OneBot OCR 降级未成功。\n"
                             f"当前模型：`{model_desc}`\n\n"
-                            "请在 OpenClaw 中切换到支持 image 的模型后重试。"
+                            "可选方案：\n"
+                            "1) 切换到支持 image 的模型\n"
+                            "2) 发送图片中的文字内容，我继续处理"
                         )
                         await self._send_onebot_reply(event, warn)
                         return
@@ -957,9 +1098,14 @@ class OpenClawOneBotBridge:
         parsed = self._extract_message(event)
         parsed = await self._augment_parsed_message(event, parsed)
         normalized_text = parsed.text.strip()
-        self._record_observation(event, session_key, normalized_text, parsed.images)
 
         should_reply, latest_text = self._should_reply(event, parsed)
+        local_cmd = self._detect_local_command(latest_text, parsed.images)
+        if should_reply and local_cmd:
+            await self._handle_local_command(event, session_key, local_cmd)
+            return
+
+        self._record_observation(event, session_key, normalized_text, parsed.images)
         if not should_reply:
             return
 
