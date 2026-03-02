@@ -11,13 +11,13 @@
 ## 1. 安装依赖
 
 ```bash
-/storage/llonebot/.venv/bin/python -c "import aiohttp; print('aiohttp ok')"
+UV_CACHE_DIR=/storage/llonebot/.cache/uv uv sync
 ```
 
 ## 2. 启动桥接
 
 ```bash
-/storage/llonebot/.venv/bin/python bridge_openclaw_llonebot.py
+UV_CACHE_DIR=/storage/llonebot/.cache/uv uv run start
 ```
 
 ## 3. 可选环境变量

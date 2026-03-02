@@ -445,5 +445,9 @@ async def main() -> None:
     await bridge.run()
 
 
-if __name__ == "__main__":
+def cli() -> None:
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    cli()
