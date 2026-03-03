@@ -315,6 +315,8 @@ class OpenClawGatewayMixin:
             run_id: str | None = None
             latest_text = ""
             done = False
+            chat_acked = False
+            pending_chat_packets: list[dict[str, Any]] = []
             end_deadline = asyncio.get_running_loop().time() + timeout
 
             chat_params: dict[str, Any] = {
@@ -356,18 +358,43 @@ class OpenClawGatewayMixin:
                         raise RuntimeError(
                             f"OpenClaw chat.send failed: {err.get('code')} {err.get('message')}"
                         )
+                    chat_acked = True
                     payload = self._json_dict_or_empty(packet.get("payload"))
                     rid = payload.get("runId")
                     if isinstance(rid, str) and rid:
                         run_id = rid
+                    # chat.send ack 之前到达的 chat 事件先缓存，ack 后按 run_id 回放一次。
+                    while pending_chat_packets and not done:
+                        buffered = pending_chat_packets.pop(0)
+                        buffered_payload = self._json_dict_or_empty(buffered.get("payload"))
+                        buffered_run_id = buffered_payload.get("runId")
+                        if not isinstance(buffered_run_id, str) or not buffered_run_id:
+                            continue
+                        if run_id is None:
+                            run_id = buffered_run_id
+                        if run_id != buffered_run_id:
+                            continue
+
+                        message = self._json_dict_or_empty(buffered_payload.get("message"))
+                        text = self._extract_text_from_content(message.get("content"))
+                        if text:
+                            latest_text = text
+                        if buffered_payload.get("state") == "final":
+                            done = True
                     continue
 
                 if p_type == "event" and packet.get("event") == "chat":
+                    # 先等到 chat.send ack，避免并发时误绑定到其他 run 的事件流。
+                    if not chat_acked:
+                        pending_chat_packets.append(packet)
+                        continue
                     payload = self._json_dict_or_empty(packet.get("payload"))
                     event_run_id = payload.get("runId")
-                    if run_id is None and isinstance(event_run_id, str) and event_run_id:
+                    if not isinstance(event_run_id, str) or not event_run_id:
+                        continue
+                    if run_id is None:
                         run_id = event_run_id
-                    if run_id and event_run_id and run_id != event_run_id:
+                    if run_id != event_run_id:
                         continue
 
                     message = self._json_dict_or_empty(payload.get("message"))
