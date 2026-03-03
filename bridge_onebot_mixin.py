@@ -306,23 +306,35 @@ class OneBotMixin:
         self, pending: list[PendingObservation], latest_text: str, include_guidance: bool = True
     ) -> str:
         recent = pending[-max(1, self.cfg.context_flush_limit) :]
-        context_lines = [f"{i + 1}. {item.line}" for i, item in enumerate(recent)]
-        latest = latest_text.strip() or "（用户发送了图片）"
+        # 触发消息会先写入 pending，这里将历史与当前待回复消息拆开，避免重复占用 token。
+        history = recent[:-1] if len(recent) > 1 else []
+        latest_from_pending = recent[-1].normalized_text.strip() if recent else ""
+        latest = latest_text.strip() or latest_from_pending or "（用户发送了图片）"
+        history_lines = [f"{i + 1}. {item.line}" for i, item in enumerate(history)]
+        history_block = "\n".join(history_lines) if history_lines else "（无）"
         if not include_guidance:
-            lines = context_lines if context_lines else [latest]
-            return "```text\n" + "\n".join(lines) + "\n```"
+            return (
+                "历史记录（不含当前消息）：\n"
+                + "```text\n"
+                + history_block
+                + "\n```\n"
+                + "当前待回复消息：\n"
+                + "```text\n"
+                + latest
+                + "\n```"
+            )
         return (
-            "下面是同一会话近期消息记录（按时间顺序）：\n"
+            "你正在 QQ 群聊中对话，请结合历史继续当前话题并直接回复用户。\n"
+            + "历史记录（不含当前消息，按时间顺序）：\n"
             + "```text\n"
-            + "\n".join(context_lines)
-            + "\n```\n\n"
-            + "请结合以上记录，回复最后一条来自用户的消息。\n"
-            + "说明：消息中的@以 OneBot CQ 码表示（例如 `[CQ:at,qq=123456]`）。"
-            + "如果需要@某人，请在回复中输出对应的 CQ 码，或使用 `[@123456]`。\n\n"
-            + "最后一条消息：\n"
+            + history_block
+            + "\n```\n"
+            + "当前待回复消息：\n"
             + "```text\n"
             + latest
-            + "\n```"
+            + "\n```\n"
+            + "说明：消息中的@以 OneBot CQ 码表示（例如 `[CQ:at,qq=123456]`）。"
+            + "如果需要@某人，请在回复中输出对应的 CQ 码，或使用 `[@123456]`。"
         )
 
     def _collect_recent_images(self, pending: list[PendingObservation]) -> list[MessageImage]:
