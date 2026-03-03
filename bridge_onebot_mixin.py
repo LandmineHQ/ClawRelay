@@ -192,9 +192,9 @@ class OneBotMixin:
         sender_name: str, sender_qq: str, normalized_text: str, images: list[MessageImage], ts: float
     ) -> str:
         display = normalized_text or "（无文本）"
-        if images:
-            refs = [os.path.basename(img.file.strip()) if img.file.strip() else "unknown" for img in images]
-            display = f"{display} | 图片哈希: {', '.join(refs)}"
+        # if images:
+        #     refs = [os.path.basename(img.file.strip()) if img.file.strip() else "unknown" for img in images]
+        #     display = f"{display} | 图片哈希: {', '.join(refs)}"
         time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
         return f"{time_str} {sender_name}({sender_qq}): {display}"
 
