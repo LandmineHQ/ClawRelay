@@ -124,6 +124,14 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                     relay_ws_url,
                 )
                 return
+            if not reply:
+                logging.warning(
+                    "Skip empty OpenClaw completion reply: key=%s run_id=%s via=%s",
+                    session_key,
+                    run_id,
+                    relay_ws_url,
+                )
+                return
             await self._send_onebot_reply(route_event, self._merge_hint_reply(reply_hint, reply))
         except Exception as exc:  # noqa: BLE001
             logging.exception(
@@ -229,9 +237,10 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                     )
                     return
                 if not run_id:
-                    await self._send_onebot_reply(
-                        event,
-                        self._merge_hint_reply(reply_hint, "我暂时没有收到有效回复，请稍后再试。"),
+                    logging.warning(
+                        "OpenClaw chat.send ack missing runId/text, waiting async events: key=%s via=%s",
+                        session_key,
+                        ws_url,
                     )
                     return
 

@@ -539,7 +539,7 @@ class OpenClawGatewayMixin:
         ws_url: str,
         timeout_sec: float,
         initial_payload: dict[str, Any] | None = None,
-    ) -> str:
+    ) -> str | None:
         latest_text = ""
         done = False
         final_wait_deadline: float | None = None
@@ -620,7 +620,7 @@ class OpenClawGatewayMixin:
             run_id,
             ws_url,
         )
-        return "我暂时没有收到有效回复，请稍后再试。"
+        return None
 
     async def _submit_openclaw_once(
         self,
