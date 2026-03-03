@@ -309,7 +309,7 @@ class OneBotMixin:
         context_lines = [f"{i + 1}. {item.line}" for i, item in enumerate(recent)]
         latest = latest_text.strip() or "（用户发送了图片）"
         return (
-            "下面是同一会话近期消息记录（按时间顺序）：\n\n"
+            "下面是同一会话近期消息记录（按时间顺序）：\n"
             + "```text\n"
             + "\n".join(context_lines)
             + "\n```\n\n"
