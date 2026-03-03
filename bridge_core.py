@@ -137,11 +137,12 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
 
         pending = list(self.pending_context[session_key])
         self.pending_context[session_key].clear()
+        latest_line = pending[-1].line if pending else latest_text.strip()
 
         include_guidance = session_key not in self.session_prompt_bootstrapped
         prompt_text = self._build_prompt_from_pending(
             pending,
-            latest_text,
+            latest_line,
             include_guidance=include_guidance,
         )
         self.session_prompt_bootstrapped.add(session_key)
