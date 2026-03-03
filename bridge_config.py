@@ -1,0 +1,59 @@
+import os
+from dataclasses import dataclass
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+@dataclass
+class Config:
+    onebot_http_base: str = os.getenv("ONEBOT_HTTP_BASE", "http://127.0.0.1:3000")
+    onebot_ws_url: str = os.getenv("ONEBOT_WS_URL", "ws://127.0.0.1:3001")
+    onebot_access_token: str = os.getenv(
+        "ONEBOT_ACCESS_TOKEN", "7debeb46-2354-4b62-90d6-d308967214b3"
+    )
+
+    # User requested 18790. In this host, OpenClaw gateway websocket is 18789.
+    openclaw_ws_url: str = os.getenv("OPENCLAW_WS_URL", "ws://127.0.0.1:18790")
+    openclaw_ws_fallback_url: str = os.getenv("OPENCLAW_WS_FALLBACK_URL", "ws://127.0.0.1:18789")
+    openclaw_gateway_token: str = os.getenv(
+        "OPENCLAW_GATEWAY_TOKEN", "75fsdbnztp22tbifainyjchy4t7jt5cx"
+    )
+    openclaw_gateway_password: str = os.getenv("OPENCLAW_GATEWAY_PASSWORD", "")
+    openclaw_client_id: str = os.getenv("OPENCLAW_CLIENT_ID", "gateway-client")
+    openclaw_client_mode: str = os.getenv("OPENCLAW_CLIENT_MODE", "backend")
+    openclaw_role: str = os.getenv("OPENCLAW_ROLE", "operator")
+    openclaw_scopes: str = os.getenv("OPENCLAW_SCOPES", "operator.read,operator.write")
+    openclaw_timeout_sec: int = env_int("OPENCLAW_TIMEOUT_SEC", 180)
+    openclaw_session_prefix: str = os.getenv("OPENCLAW_SESSION_PREFIX", "qq")
+
+    request_timeout_sec: int = env_int("REQUEST_TIMEOUT_SEC", 200)
+    reconnect_delay_sec: int = env_int("RECONNECT_DELAY_SEC", 3)
+    max_reconnect_delay_sec: int = env_int("MAX_RECONNECT_DELAY_SEC", 30)
+    max_concurrency: int = env_int("MAX_CONCURRENCY", 3)
+    context_observation_limit: int = env_int("CONTEXT_OBSERVATION_LIMIT", 30)
+    context_flush_limit: int = env_int("CONTEXT_FLUSH_LIMIT", 12)
+    max_image_attachments: int = env_int("MAX_IMAGE_ATTACHMENTS", 3)
+    max_image_download_bytes: int = env_int("MAX_IMAGE_DOWNLOAD_BYTES", 6 * 1024 * 1024)
+    image_model_probe_ttl_sec: int = env_int("IMAGE_MODEL_PROBE_TTL_SEC", 300)
+
+    group_require_at: bool = env_bool("GROUP_REQUIRE_AT", True)
+    group_prefix: str = os.getenv("GROUP_PREFIX", "/ai")
+    group_reply_at_sender: bool = env_bool("GROUP_REPLY_AT_SENDER", True)
+
+    self_qq: str = os.getenv("BOT_SELF_QQ", "")
+    log_level: str = os.getenv("LOG_LEVEL", "INFO")

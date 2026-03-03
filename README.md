@@ -8,16 +8,25 @@
 - `llonebot WS`: `ws://127.0.0.1:3001`
 - `OpenClaw Gateway WS`: 主地址 `ws://127.0.0.1:18790`，自动回退 `ws://127.0.0.1:18789`
 
+## 代码结构
+
+- `bridge_openclaw_llonebot.py`：启动入口（`main/cli`）
+- `bridge_core.py`：桥接主流程编排（收消息、触发命令、上下文冲刷、调用两侧模块）
+- `bridge_onebot_mixin.py`：OneBot v11 解析与 HTTP 调用、图片下载与附件构建
+- `bridge_openclaw_mixin.py`：OpenClaw Gateway 连接、请求、模型能力探测
+- `bridge_config.py`：配置与环境变量解析
+- `bridge_models.py`：共享数据结构（消息、图片、上下文观测）
+
 ## 1. 安装依赖
 
 ```bash
-UV_CACHE_DIR=/storage/llonebot/.cache/uv uv sync
+uv sync
 ```
 
 ## 2. 启动桥接
 
 ```bash
-UV_CACHE_DIR=/storage/llonebot/.cache/uv uv run start
+uv run start
 ```
 
 ## 3. 可选环境变量

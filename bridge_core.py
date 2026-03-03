@@ -1,0 +1,173 @@
+import asyncio
+import json
+import logging
+from collections import defaultdict, deque
+from typing import Any
+
+import aiohttp
+
+from bridge_config import Config
+from bridge_models import MessageImage, PendingObservation
+from bridge_onebot_mixin import OneBotMixin
+from bridge_openclaw_mixin import OpenClawGatewayMixin
+
+
+class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self.session: aiohttp.ClientSession | None = None
+        self.sem = asyncio.Semaphore(max(1, self.cfg.max_concurrency))
+        self.bg_tasks: set[asyncio.Task[Any]] = set()
+        self.seen_ids: deque[str] = deque(maxlen=2000)
+        self.seen_set: set[str] = set()
+        self.pending_context: dict[str, deque[PendingObservation]] = defaultdict(
+            lambda: deque(maxlen=max(2, self.cfg.context_observation_limit))
+        )
+        self.preferred_openclaw_ws_url: str = ""
+        self.image_support_cache_until: float = 0.0
+        self.image_support_cache_value: bool | None = None
+        self.image_support_model_desc: str = "unknown"
+
+    def _discard_bg_task(self, task: asyncio.Task[Any]) -> None:
+        self.bg_tasks.discard(task)
+
+    async def _handle_local_command(
+        self, event: dict[str, Any], session_key: str, command: str
+    ) -> None:
+        cmd = command.strip().lower()
+        if cmd == "/help":
+            await self._send_onebot_reply(event, self._help_text())
+            return
+
+        if cmd == "/new":
+            # 清除桥接侧暂存上下文，并重置 OpenClaw 会话。
+            self.pending_context[session_key].clear()
+            ok, err = await self._reset_openclaw_session(session_key)
+            if ok:
+                await self._send_onebot_reply(event, "已重置当前会话。")
+            else:
+                await self._send_onebot_reply(
+                    event,
+                    f"会话重置失败：{err}\n请检查 OpenClaw token/scopes（需要 operator.admin）。",
+                )
+
+    async def _process_message(
+        self,
+        event: dict[str, Any],
+        session_key: str,
+        prompt_text: str,
+        image_candidates: list[MessageImage],
+    ) -> None:
+        async with self.sem:
+            logging.info(
+                "Processing message user=%s group=%s key=%s text=%s images=%s",
+                event.get("user_id"),
+                event.get("group_id"),
+                session_key,
+                prompt_text[:120],
+                len(image_candidates),
+            )
+
+            try:
+                attachments = await self._build_image_attachments(image_candidates)
+                logging.info(
+                    "Attachment build result: candidate_images=%s attachments=%s key=%s",
+                    len(image_candidates),
+                    len(attachments),
+                    session_key,
+                )
+
+                if attachments:
+                    supports_image, model_desc = await self._detect_image_model_support()
+                    if not supports_image:
+                        reply = await self._ask_openclaw(session_key, prompt_text, [])
+                        hint = f"【提示】当前模型不支持 image 输入（{model_desc}），已忽略图片附件。"
+                        await self._send_onebot_reply(event, f"{hint}\n{reply}")
+                        return
+
+                reply = await self._ask_openclaw(session_key, prompt_text, attachments)
+                await self._send_onebot_reply(event, reply)
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Bridge processing failed: %s", exc)
+                try:
+                    await self._send_onebot_reply(event, "OpenClaw暂时不可用，请稍后再试。")
+                except Exception:  # noqa: BLE001
+                    logging.exception("Fallback reply send failed")
+
+    async def _handle_onebot_event(self, event: dict[str, Any]) -> None:
+        message_id = event.get("message_id")
+        if not self._mark_seen(message_id):
+            return
+
+        if not self._should_process_event(event):
+            return
+
+        session_key = self._build_session_key(event)
+        parsed = self._extract_message(event)
+        parsed = await self._augment_parsed_message(event, parsed)
+        normalized_text = parsed.text.strip()
+
+        should_reply, latest_text = self._should_reply(event, parsed)
+        local_cmd = self._detect_local_command(latest_text, parsed.images)
+        if should_reply and local_cmd:
+            await self._handle_local_command(event, session_key, local_cmd)
+            return
+
+        self._record_observation(event, session_key, normalized_text, parsed.images)
+        if not should_reply:
+            return
+
+        pending = list(self.pending_context[session_key])
+        self.pending_context[session_key].clear()
+
+        prompt_text = self._build_prompt_from_pending(pending, latest_text)
+        image_candidates = self._collect_recent_images(pending)
+        task = asyncio.create_task(
+            self._process_message(
+                event,
+                session_key,
+                prompt_text,
+                image_candidates,
+            )
+        )
+        self.bg_tasks.add(task)
+        task.add_done_callback(self._discard_bg_task)
+
+    async def run(self) -> None:
+        timeout = aiohttp.ClientTimeout(total=self.cfg.request_timeout_sec)
+        delay = max(1, self.cfg.reconnect_delay_sec)
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            self.session = session
+            while True:
+                try:
+                    logging.info("Connecting OneBot WS: %s", self.cfg.onebot_ws_url)
+                    async with session.ws_connect(
+                        self.cfg.onebot_ws_url,
+                        headers=self._onebot_headers(),
+                        heartbeat=30,
+                    ) as ws:
+                        logging.info("OneBot WS connected")
+                        delay = max(1, self.cfg.reconnect_delay_sec)
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    parsed = json.loads(msg.data)
+                                except json.JSONDecodeError:
+                                    logging.warning("OneBot non-JSON packet: %s", msg.data[:200])
+                                    continue
+                                if not isinstance(parsed, dict):
+                                    logging.warning("OneBot non-object packet: %s", msg.data[:200])
+                                    continue
+                                event: dict[str, Any] = {}
+                                for key, value in parsed.items():
+                                    event[str(key)] = value
+                                await self._handle_onebot_event(event)
+                            elif msg.type in {aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED}:
+                                break
+                except Exception as exc:  # noqa: BLE001
+                    logging.exception("OneBot WS error: %s", exc)
+
+                logging.info("Reconnecting in %s seconds...", delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, max(delay, self.cfg.max_reconnect_delay_sec))

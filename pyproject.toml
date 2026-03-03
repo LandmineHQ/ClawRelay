@@ -18,5 +18,23 @@ package = true
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
+[dependency-groups]
+dev = [
+    "pyright>=1.1.408",
+]
+
 [tool.setuptools]
-py-modules = ["bridge_openclaw_llonebot", "main"]
+py-modules = [
+    "bridge_openclaw_llonebot",
+    "bridge_core",
+    "bridge_config",
+    "bridge_models",
+    "bridge_onebot_mixin",
+    "bridge_openclaw_mixin",
+    "main",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.12"
