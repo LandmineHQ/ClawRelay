@@ -32,10 +32,7 @@ class OneBotMixin:
     def _build_session_key(self, event: dict[str, Any]) -> str:
         if event.get("message_type") == "private":
             return f"{self.cfg.openclaw_session_prefix}:private:{event.get('user_id')}"
-        return (
-            f"{self.cfg.openclaw_session_prefix}:group:{event.get('group_id')}:"
-            f"user:{event.get('user_id')}"
-        )
+        return f"{self.cfg.openclaw_session_prefix}:group:{event.get('group_id')}"
 
     def _get_self_qq(self, event: dict[str, Any]) -> str:
         if self.cfg.self_qq:
