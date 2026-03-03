@@ -308,15 +308,17 @@ class OneBotMixin:
         context_lines = [f"{i + 1}. {item.line}" for i, item in enumerate(recent)]
         latest = latest_text.strip() or "（用户发送了图片）"
         return (
-            "下面是同一会话近期消息记录（按时间顺序）：\n"
-            + "```\n"
+            "下面是同一会话近期消息记录（按时间顺序）：\n\n"
+            + "```text\n"
             + "\n".join(context_lines)
-            + "\n"
-            + "```\n"
+            + "\n```\n\n"
             + "请结合以上记录，回复最后一条来自用户的消息。\n"
             + "说明：消息中的@以 OneBot CQ 码表示（例如 `[CQ:at,qq=123456]`）。"
-            + "如果需要@某人，请在回复中输出对应的 CQ 码，或使用 `[@123456]`。\n"
-            + f"最后一条消息：`{latest}`"
+            + "如果需要@某人，请在回复中输出对应的 CQ 码，或使用 `[@123456]`。\n\n"
+            + "最后一条消息：\n"
+            + "```text\n"
+            + latest
+            + "\n```"
         )
 
     def _collect_recent_images(self, pending: list[PendingObservation]) -> list[MessageImage]:
