@@ -230,16 +230,32 @@ class OneBotMixin:
         if message_type == "private":
             return True, raw
 
+        mentioned = parsed.mentioned
+        effective_text = raw
+        if not mentioned:
+            effective_text, mentioned = self._strip_leading_plain_mention(raw)
+
+        if not effective_text and not parsed.images:
+            return False, ""
+
         prefix = self.cfg.group_prefix.strip()
-        if prefix and raw.startswith(prefix):
-            stripped = raw[len(prefix) :].strip()
+        if prefix and effective_text.startswith(prefix):
+            stripped = effective_text[len(prefix) :].strip()
             if stripped or parsed.images:
                 return True, stripped
 
-        if self.cfg.group_require_at and not parsed.mentioned:
+        if self.cfg.group_require_at and not mentioned:
             return False, raw
 
-        return True, raw
+        return True, effective_text
+
+    @staticmethod
+    def _strip_leading_plain_mention(text: str) -> tuple[str, bool]:
+        # Some clients send plain text like "@机器人 /new" instead of CQ at segment.
+        matched = re.match(r"^\s*@[^ \t\r\n]+\s*", text)
+        if not matched:
+            return text, False
+        return text[matched.end() :].strip(), True
 
     @staticmethod
     def _detect_local_command(text: str, images: list[MessageImage]) -> str | None:
