@@ -23,6 +23,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self.pending_context: dict[str, deque[PendingObservation]] = defaultdict(
             lambda: deque(maxlen=max(2, self.cfg.context_observation_limit))
         )
+        self.session_prompt_bootstrapped: set[str] = set()
         self.preferred_openclaw_ws_url: str = ""
         self.image_support_cache_until: float = 0.0
         self.image_support_cache_value: bool | None = None
@@ -42,6 +43,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         if cmd == "/new":
             # 清除桥接侧暂存上下文，并重置 OpenClaw 会话。
             self.pending_context[session_key].clear()
+            self.session_prompt_bootstrapped.discard(session_key)
             ok, err = await self._reset_openclaw_session(session_key)
             if ok:
                 await self._send_onebot_reply(event, "已重置当前会话。")
@@ -136,7 +138,13 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         pending = list(self.pending_context[session_key])
         self.pending_context[session_key].clear()
 
-        prompt_text = self._build_prompt_from_pending(pending, latest_text)
+        include_guidance = session_key not in self.session_prompt_bootstrapped
+        prompt_text = self._build_prompt_from_pending(
+            pending,
+            latest_text,
+            include_guidance=include_guidance,
+        )
+        self.session_prompt_bootstrapped.add(session_key)
         image_candidates = self._collect_recent_images(pending)
         task = asyncio.create_task(
             self._process_message(

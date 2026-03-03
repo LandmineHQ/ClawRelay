@@ -303,11 +303,14 @@ class OneBotMixin:
         )
 
     def _build_prompt_from_pending(
-        self, pending: list[PendingObservation], latest_text: str
+        self, pending: list[PendingObservation], latest_text: str, include_guidance: bool = True
     ) -> str:
         recent = pending[-max(1, self.cfg.context_flush_limit) :]
         context_lines = [f"{i + 1}. {item.line}" for i, item in enumerate(recent)]
         latest = latest_text.strip() or "（用户发送了图片）"
+        if not include_guidance:
+            lines = context_lines if context_lines else [latest]
+            return "```text\n" + "\n".join(lines) + "\n```"
         return (
             "下面是同一会话近期消息记录（按时间顺序）：\n"
             + "```text\n"
