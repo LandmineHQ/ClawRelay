@@ -39,7 +39,7 @@ class Config:
     openclaw_role: str = os.getenv("OPENCLAW_ROLE", "operator")
     openclaw_scopes: str = os.getenv("OPENCLAW_SCOPES", "operator.read,operator.write")
     openclaw_timeout_sec: int = env_int("OPENCLAW_TIMEOUT_SEC", 180)
-    openclaw_session_prefix: str = os.getenv("OPENCLAW_SESSION_PREFIX", "qq")
+    openclaw_session_prefix: str = os.getenv("OPENCLAW_SESSION_PREFIX", "llonebot")
 
     request_timeout_sec: int = env_int("REQUEST_TIMEOUT_SEC", 200)
     reconnect_delay_sec: int = env_int("RECONNECT_DELAY_SEC", 3)

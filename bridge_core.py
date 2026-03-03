@@ -113,6 +113,22 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             await self._handle_local_command(event, session_key, local_cmd)
             return
 
+        # Private chat: send user content directly to OpenClaw without local prompt building.
+        if event.get("message_type") == "private":
+            if not should_reply:
+                return
+            task = asyncio.create_task(
+                self._process_message(
+                    event,
+                    session_key,
+                    latest_text,
+                    parsed.images,
+                )
+            )
+            self.bg_tasks.add(task)
+            task.add_done_callback(self._discard_bg_task)
+            return
+
         self._record_observation(event, session_key, normalized_text, parsed.images)
         if not should_reply:
             return
