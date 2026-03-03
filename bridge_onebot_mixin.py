@@ -310,6 +310,7 @@ class OneBotMixin:
         history = recent[:-1] if len(recent) > 1 else []
         latest_from_pending = recent[-1].normalized_text.strip() if recent else ""
         latest = latest_text.strip() or latest_from_pending or "（用户发送了图片）"
+        current_line = recent[-1].line if recent else "unknown(unknown): （无）"
         history_lines = [f"{i + 1}. {item.line}" for i, item in enumerate(history)]
         history_block = "\n".join(history_lines) if history_lines else "（无）"
         if not include_guidance:
@@ -320,6 +321,9 @@ class OneBotMixin:
                 + "\n```\n"
                 + "当前待回复消息：\n"
                 + "```text\n"
+                + current_line
+                + "\n"
+                + "内容: "
                 + latest
                 + "\n```"
             )
@@ -331,6 +335,9 @@ class OneBotMixin:
             + "\n```\n"
             + "当前待回复消息：\n"
             + "```text\n"
+            + current_line
+            + "\n"
+            + "内容: "
             + latest
             + "\n```\n"
             + "说明：消息中的@以 OneBot CQ 码表示（例如 `[CQ:at,qq=123456]`）。"
