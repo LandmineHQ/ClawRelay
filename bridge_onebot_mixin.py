@@ -41,6 +41,13 @@ class OneBotMixin:
         return str(self_id) if self_id is not None else ""
 
     @staticmethod
+    def _mention_tag(qq: str) -> str:
+        qq_value = qq.strip()
+        if not qq_value:
+            return ""
+        return f"[CQ:at,qq={qq_value}]"
+
+    @staticmethod
     def _parse_cq_params(params_text: str) -> dict[str, str]:
         out: dict[str, str] = {}
         if not params_text.strip():
@@ -94,9 +101,12 @@ class OneBotMixin:
                 if seg_type == "text":
                     text_parts.append(str(data.get("text", "")))
                 elif seg_type == "at":
-                    qq = str(data.get("qq", ""))
+                    qq = str(data.get("qq", "")).strip()
                     if self_qq and qq == self_qq:
                         mentioned = True
+                    mention_text = self._mention_tag(qq)
+                    if mention_text:
+                        text_parts.append(mention_text)
                 elif seg_type == "image":
                     url = str(data.get("url", "")).strip()
                     file = str(data.get("file", "")).strip()
@@ -115,9 +125,12 @@ class OneBotMixin:
                 cq_type = matched.group(1)
                 params = self._parse_cq_params(matched.group(2) or "")
                 if cq_type == "at":
-                    qq = params.get("qq", "")
+                    qq = params.get("qq", "").strip()
                     if self_qq and qq == self_qq:
                         mentioned = True
+                    mention_text = self._mention_tag(qq)
+                    if mention_text:
+                        text_parts.append(mention_text)
                     continue
                 if cq_type == "image":
                     img = MessageImage(
@@ -176,25 +189,26 @@ class OneBotMixin:
 
     @staticmethod
     def _format_observation_line(
-        sender_name: str, normalized_text: str, images: list[MessageImage], ts: float
+        sender_name: str, sender_qq: str, normalized_text: str, images: list[MessageImage], ts: float
     ) -> str:
         display = normalized_text or "（无文本）"
         if images:
             refs = [os.path.basename(img.file.strip()) if img.file.strip() else "unknown" for img in images]
             display = f"{display} | 图片哈希: {', '.join(refs)}"
         time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
-        return f"{time_str} {sender_name}: {display}"
+        return f"{time_str} {sender_name}({sender_qq}): {display}"
 
     def _record_observation(
         self, event: dict[str, Any], session_key: str, normalized_text: str, images: list[MessageImage]
     ) -> None:
         sender_name = self._sender_name(event)
+        sender_qq = str(event.get("user_id", "unknown"))
         ts_raw = event.get("time")
         try:
             ts = float(ts_raw) if ts_raw is not None else datetime.now().timestamp()
         except (TypeError, ValueError):
             ts = datetime.now().timestamp()
-        line = self._format_observation_line(sender_name, normalized_text, images, ts)
+        line = self._format_observation_line(sender_name, sender_qq, normalized_text, images, ts)
         self.pending_context[session_key].append(
             PendingObservation(
                 line=line,
@@ -261,7 +275,20 @@ class OneBotMixin:
     def _detect_local_command(text: str, images: list[MessageImage]) -> str | None:
         if images:
             return None
-        stripped = (text or "").strip().lower()
+        stripped = (text or "").strip()
+        while True:
+            next_value = re.sub(
+                r"^\s*\[CQ:at,qq=[^\]]+\]\s*",
+                "",
+                stripped,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            if next_value == stripped:
+                break
+            stripped = next_value
+        stripped, _ = OneBotMixin._strip_leading_plain_mention(stripped)
+        stripped = stripped.strip().lower()
         if stripped in {"/new", "/help"}:
             return stripped
         return None
@@ -284,6 +311,8 @@ class OneBotMixin:
             "下面是同一会话近期消息记录（按时间顺序）：\n"
             + "\n".join(context_lines)
             + "\n\n请结合以上记录，回复最后一条来自用户的消息。\n"
+            + "说明：消息中的@以 OneBot CQ 码表示（例如 `[CQ:at,qq=123456]`）。"
+            + "如果需要@某人，请在回复中输出对应的 CQ 码，或使用 `[@123456]`。\n"
             + f"最后一条消息：{latest}"
         )
 
@@ -328,9 +357,13 @@ class OneBotMixin:
             payload = {"user_id": event.get("user_id"), "message": text, "auto_escape": False}
         else:
             endpoint = "send_group_msg"
-            group_text = text
-            if self.cfg.group_reply_at_sender and event.get("user_id") is not None:
-                group_text = f"[CQ:at,qq={event['user_id']}] {text}"
+            group_text = self._normalize_outgoing_mentions(text)
+            if (
+                self.cfg.group_reply_at_sender
+                and event.get("user_id") is not None
+                and not self._contains_cq_at(group_text)
+            ):
+                group_text = f"[CQ:at,qq={event['user_id']}] {group_text}"
             payload = {"group_id": event.get("group_id"), "message": group_text, "auto_escape": False}
 
         url = f"{self.cfg.onebot_http_base.rstrip('/')}/{endpoint}"
@@ -353,6 +386,17 @@ class OneBotMixin:
             data = parsed
             if data.get("status") != "ok" and data.get("retcode") not in (0, None):
                 raise RuntimeError(f"OneBot send failed: {data}")
+
+    @staticmethod
+    def _contains_cq_at(text: str) -> bool:
+        return bool(re.search(r"\[CQ:at,qq=[^\]]+\]", text, flags=re.IGNORECASE))
+
+    @staticmethod
+    def _normalize_outgoing_mentions(text: str) -> str:
+        # Allow model to use lightweight mention form like [@123456] / [@qq=123456].
+        out = re.sub(r"\[@(?:qq=)?(\d+)\]", r"[CQ:at,qq=\1]", text, flags=re.IGNORECASE)
+        out = re.sub(r"\[@all\]", "[CQ:at,qq=all]", out, flags=re.IGNORECASE)
+        return out
 
     async def _onebot_action(
         self, action: str, payload: dict[str, Any], timeout_sec: float | None = None
