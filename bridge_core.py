@@ -28,6 +28,9 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self.gateway_pending_reqs: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self.gateway_run_payloads: defaultdict[str, deque[dict[str, Any]]] = defaultdict(deque)
         self.gateway_run_waiters: dict[str, asyncio.Future[None]] = {}
+        self.gateway_relay_runs: set[str] = set()
+        self.gateway_run_preferred_targets: dict[str, dict[str, Any]] = {}
+        self.session_onebot_routes: dict[str, dict[str, Any]] = {}
         self.pending_context: dict[str, deque[PendingObservation]] = defaultdict(
             lambda: deque(maxlen=max(2, self.cfg.context_observation_limit))
         )
@@ -39,6 +42,125 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
 
     def _discard_bg_task(self, task: asyncio.Task[Any]) -> None:
         self.bg_tasks.discard(task)
+
+    @staticmethod
+    def _normalize_openclaw_session_key(session_key: str) -> str:
+        key = session_key.strip()
+        prefix = "agent:main:"
+        if key.startswith(prefix):
+            return key[len(prefix) :]
+        return key
+
+    def _bind_onebot_route(self, session_key: str, event: dict[str, Any]) -> None:
+        key = self._normalize_openclaw_session_key(session_key)
+        if not key:
+            return
+        route: dict[str, Any] = {
+            "message_type": event.get("message_type"),
+        }
+        if event.get("self_id") is not None:
+            route["self_id"] = event.get("self_id")
+        if event.get("user_id") is not None:
+            route["user_id"] = event.get("user_id")
+        if event.get("group_id") is not None:
+            route["group_id"] = event.get("group_id")
+        self.session_onebot_routes[key] = route
+
+    @staticmethod
+    def _merge_hint_reply(hint: str, reply: str) -> str:
+        hint_text = hint.strip()
+        reply_text = reply.strip()
+        if hint_text and reply_text:
+            return f"{hint_text}\n{reply_text}"
+        return hint_text or reply_text
+
+    async def _relay_unsolicited_completion_to_onebot(
+        self,
+        run_id: str,
+        initial_payload: dict[str, Any],
+        ws_url: str,
+    ) -> None:
+        payload_session_key = str(initial_payload.get("sessionKey", "")).strip()
+        normalized_payload_key = self._normalize_openclaw_session_key(payload_session_key)
+
+        session_key = normalized_payload_key or "unknown"
+        relay_ws_url = ws_url
+
+        preferred = self.gateway_run_preferred_targets.get(run_id)
+        if preferred:
+            preferred_key = str(preferred.get("session_key", "")).strip()
+            if preferred_key:
+                session_key = preferred_key
+            preferred_ws = str(preferred.get("ws_url", "")).strip()
+            if preferred_ws:
+                relay_ws_url = preferred_ws
+
+        try:
+            reply = await self._wait_shared_run_result(
+                run_id=run_id,
+                session_key=session_key,
+                ws_url=relay_ws_url,
+                timeout_sec=float(self.cfg.openclaw_timeout_sec),
+                initial_payload=initial_payload,
+            )
+            preferred = self.gateway_run_preferred_targets.get(run_id)
+            route_event: dict[str, Any] | None = None
+            reply_hint = ""
+            if preferred:
+                preferred_key = str(preferred.get("session_key", "")).strip()
+                if preferred_key:
+                    session_key = preferred_key
+                preferred_event = preferred.get("event")
+                if isinstance(preferred_event, dict):
+                    route_event = dict(preferred_event)
+                reply_hint = str(preferred.get("reply_hint", "")).strip()
+            if route_event is None:
+                route_event = self.session_onebot_routes.get(session_key)
+            if route_event is None:
+                logging.warning(
+                    "Drop OpenClaw completion without bound OneBot route: key=%s run_id=%s via=%s",
+                    session_key,
+                    run_id,
+                    relay_ws_url,
+                )
+                return
+            await self._send_onebot_reply(route_event, self._merge_hint_reply(reply_hint, reply))
+        except Exception as exc:  # noqa: BLE001
+            logging.exception(
+                "Unsolicited completion relay failed: %s (key=%s run_id=%s via=%s)",
+                exc,
+                session_key,
+                run_id,
+                relay_ws_url,
+            )
+            preferred = self.gateway_run_preferred_targets.get(run_id)
+            route_event: dict[str, Any] | None = None
+            if preferred:
+                preferred_event = preferred.get("event")
+                if isinstance(preferred_event, dict):
+                    route_event = dict(preferred_event)
+            if route_event is None:
+                route_event = self.session_onebot_routes.get(session_key)
+            if route_event is not None:
+                try:
+                    await self._send_onebot_reply(route_event, "OpenClaw暂时不可用，请稍后再试。")
+                except Exception:  # noqa: BLE001
+                    logging.exception("Fallback unsolicited reply send failed")
+        finally:
+            self.gateway_relay_runs.discard(run_id)
+            self.gateway_run_preferred_targets.pop(run_id, None)
+
+    async def _on_gateway_run_event(
+        self, run_id: str, payload: dict[str, Any], ws_url: str
+    ) -> None:
+        if run_id in self.gateway_relay_runs:
+            return
+        self.gateway_relay_runs.add(run_id)
+        task = asyncio.create_task(
+            self._relay_unsolicited_completion_to_onebot(run_id, dict(payload), ws_url)
+        )
+        self.bg_tasks.add(task)
+        task.add_done_callback(self._discard_bg_task)
 
     async def _handle_local_command(
         self, event: dict[str, Any], session_key: str, command: str
@@ -86,17 +208,40 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                     len(attachments),
                     session_key,
                 )
+                reply_hint = ""
 
                 if attachments:
                     supports_image, model_desc = await self._detect_image_model_support()
                     if not supports_image:
-                        reply = await self._ask_openclaw(session_key, prompt_text, [])
-                        hint = f"【提示】当前模型不支持 image 输入（{model_desc}），已忽略图片附件。"
-                        await self._send_onebot_reply(event, f"{hint}\n{reply}")
-                        return
+                        attachments = []
+                        reply_hint = (
+                            f"【提示】当前模型不支持 image 输入（{model_desc}），已忽略图片附件。"
+                        )
 
-                reply = await self._ask_openclaw(session_key, prompt_text, attachments)
-                await self._send_onebot_reply(event, reply)
+                ws_url, run_id, instant_text = await self._submit_openclaw(
+                    session_key,
+                    prompt_text,
+                    attachments,
+                )
+                if instant_text:
+                    await self._send_onebot_reply(
+                        event, self._merge_hint_reply(reply_hint, instant_text)
+                    )
+                    return
+                if not run_id:
+                    await self._send_onebot_reply(
+                        event,
+                        self._merge_hint_reply(reply_hint, "我暂时没有收到有效回复，请稍后再试。"),
+                    )
+                    return
+
+                self.gateway_run_preferred_targets[run_id] = {
+                    "event": dict(event),
+                    "session_key": session_key,
+                    "reply_hint": reply_hint,
+                    "ws_url": ws_url,
+                }
+                # chat.send 成功即可返回，后续由 Gateway completion 事件自动转发到 OneBot。
             except Exception as exc:  # noqa: BLE001
                 logging.exception("Bridge processing failed: %s", exc)
                 try:
@@ -113,6 +258,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             return
 
         session_key = self._build_session_key(event)
+        self._bind_onebot_route(session_key, event)
         parsed = self._extract_message(event)
         parsed = await self._augment_parsed_message(event, parsed)
         normalized_text = parsed.text.strip()

@@ -27,6 +27,12 @@ class OpenClawGatewayMixin:
     gateway_run_payloads: defaultdict[str, deque[dict[str, Any]]]
     gateway_run_waiters: dict[str, asyncio.Future[None]]
 
+    async def _on_gateway_run_event(
+        self, run_id: str, payload: dict[str, Any], ws_url: str
+    ) -> None:
+        # Optional hook for bridge-level routing/dispatch logic.
+        return
+
     @staticmethod
     def _to_json_dict(value: object) -> dict[str, Any] | None:
         if not isinstance(value, dict):
@@ -129,6 +135,7 @@ class OpenClawGatewayMixin:
             for key in (
                 "runId",
                 "state",
+                "event",
                 "seq",
                 "sessionKey",
                 "message",
@@ -195,6 +202,15 @@ class OpenClawGatewayMixin:
                         waiter = self.gateway_run_waiters.pop(run_id, None)
                         if waiter is not None and not waiter.done():
                             waiter.set_result(None)
+                        try:
+                            await self._on_gateway_run_event(run_id, payload, ws_url)
+                        except Exception as exc:  # noqa: BLE001
+                            logging.warning(
+                                "Gateway run event hook failed: run_id=%s via=%s err=%s",
+                                run_id,
+                                ws_url,
+                                exc,
+                            )
         except Exception as exc:  # noqa: BLE001
             logging.warning("Shared OpenClaw gateway loop closed via=%s: %s", ws_url, exc)
         finally:
@@ -537,7 +553,12 @@ class OpenClawGatewayMixin:
             if text:
                 latest_text = text
                 final_wait_deadline = None
-            if payload.get("state") == "final":
+            state_value = str(payload.get("state", "")).strip().lower()
+            event_value = str(payload.get("event", "")).strip().lower()
+            is_completion = state_value in {"final", "completed", "completion", "done"} or (
+                event_value == "completion" or event_value.endswith(".completion")
+            )
+            if is_completion:
                 if latest_text:
                     done = True
                 else:
@@ -601,13 +622,13 @@ class OpenClawGatewayMixin:
         )
         return "我暂时没有收到有效回复，请稍后再试。"
 
-    async def _ask_openclaw_once(
+    async def _submit_openclaw_once(
         self,
         ws_url: str,
         session_key: str,
         user_text: str,
         attachments: list[dict[str, str]],
-    ) -> str:
+    ) -> tuple[str | None, str | None]:
         timeout = float(self.cfg.openclaw_timeout_sec)
         chat_params: dict[str, Any] = {
             "sessionKey": session_key,
@@ -638,26 +659,19 @@ class OpenClawGatewayMixin:
             # 兜底：某些实现可能在 ack 里直接给最终文本但不给 runId。
             text = self._extract_text_from_chat_payload(payload)
             if text:
-                return text
+                return None, text
             logging.warning(
                 "OpenClaw chat.send ack missing runId and text: key=%s via=%s payload_keys=%s",
                 session_key,
                 ws_url,
                 sorted(payload.keys()),
             )
-            return "我暂时没有收到有效回复，请稍后再试。"
+            return None, None
+        return run_id, None
 
-        return await self._wait_shared_run_result(
-            run_id=run_id,
-            session_key=session_key,
-            ws_url=ws_url,
-            timeout_sec=timeout,
-            initial_payload=payload,
-        )
-
-    async def _ask_openclaw(
+    async def _submit_openclaw(
         self, session_key: str, user_text: str, attachments: list[dict[str, str]]
-    ) -> str:
+    ) -> tuple[str, str | None, str | None]:
         urls: list[str] = []
         ordered_sources = [
             self.preferred_openclaw_ws_url,
@@ -671,9 +685,11 @@ class OpenClawGatewayMixin:
         last_err: Exception | None = None
         for url in urls:
             try:
-                result = await self._ask_openclaw_once(url, session_key, user_text, attachments)
+                run_id, text = await self._submit_openclaw_once(
+                    url, session_key, user_text, attachments
+                )
                 self.preferred_openclaw_ws_url = url
-                return result
+                return url, run_id, text
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
                 if self.gateway_ws_url == url:
