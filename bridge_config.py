@@ -53,7 +53,7 @@ class Config:
 
     group_require_at: bool = env_bool("GROUP_REQUIRE_AT", True)
     group_prefix: str = os.getenv("GROUP_PREFIX", "/ai")
-    group_reply_at_sender: bool = env_bool("GROUP_REPLY_AT_SENDER", True)
+    group_reply_at_sender: bool = env_bool("GROUP_REPLY_AT_SENDER", False)
 
     self_qq: str = os.getenv("BOT_SELF_QQ", "")
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
