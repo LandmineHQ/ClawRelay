@@ -27,11 +27,9 @@ class Config:
         "ONEBOT_ACCESS_TOKEN", "7debeb46-2354-4b62-90d6-d308967214b3"
     )
 
-    # User requested 18790. In this host, OpenClaw gateway websocket is 18789.
-    openclaw_ws_url: str = os.getenv("OPENCLAW_WS_URL", "ws://127.0.0.1:18790")
-    openclaw_ws_fallback_url: str = os.getenv("OPENCLAW_WS_FALLBACK_URL", "ws://127.0.0.1:18789")
+    openclaw_ws_url: str = os.getenv("OPENCLAW_WS_URL", "ws://127.0.0.1:18789")
     openclaw_gateway_token: str = os.getenv(
-        "OPENCLAW_GATEWAY_TOKEN", "75fsdbnztp22tbifainyjchy4t7jt5cx"
+        "OPENCLAW_GATEWAY_TOKEN", "tifptgkqzf32zrraggcych6gqyq7x52x"
     )
     openclaw_gateway_password: str = os.getenv("OPENCLAW_GATEWAY_PASSWORD", "")
     openclaw_client_id: str = os.getenv("OPENCLAW_CLIENT_ID", "gateway-client")

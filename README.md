@@ -6,7 +6,7 @@
 
 - `llonebot HTTP`: `http://127.0.0.1:3000`
 - `llonebot WS`: `ws://127.0.0.1:3001`
-- `OpenClaw Gateway WS`: 主地址 `ws://127.0.0.1:18790`，自动回退 `ws://127.0.0.1:18789`
+- `OpenClaw Gateway WS`: `ws://127.0.0.1:18789`
 
 ## 代码结构
 
@@ -34,8 +34,7 @@ uv run start
 - `ONEBOT_HTTP_BASE`：默认 `http://127.0.0.1:3000`
 - `ONEBOT_WS_URL`：默认 `ws://127.0.0.1:3001`
 - `ONEBOT_ACCESS_TOKEN`：OneBot token（默认已内置你提供的 token，也可覆盖）
-- `OPENCLAW_WS_URL`：默认 `ws://127.0.0.1:18790`
-- `OPENCLAW_WS_FALLBACK_URL`：默认 `ws://127.0.0.1:18789`
+- `OPENCLAW_WS_URL`：默认 `ws://127.0.0.1:18789`
 - `OPENCLAW_GATEWAY_TOKEN`：Gateway token（默认写入了当前机器 OpenClaw 配置中的 token，可覆盖）
 - `OPENCLAW_GATEWAY_PASSWORD`：Gateway password（如你使用密码鉴权）
 - `OPENCLAW_CLIENT_ID`：默认 `gateway-client`

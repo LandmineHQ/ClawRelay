@@ -73,7 +73,7 @@ class OpenClawGatewayMixin:
             scopes = [*scopes, "operator.admin"]
 
         urls: list[str] = []
-        for item in [self.preferred_openclaw_ws_url, self.cfg.openclaw_ws_url, self.cfg.openclaw_ws_fallback_url]:
+        for item in [self.preferred_openclaw_ws_url, self.cfg.openclaw_ws_url]:
             item = item.strip()
             if item and item not in urls:
                 urls.append(item)
@@ -198,7 +198,7 @@ class OpenClawGatewayMixin:
             return self.image_support_cache_value, self.image_support_model_desc
 
         urls: list[str] = []
-        for item in [self.preferred_openclaw_ws_url, self.cfg.openclaw_ws_url, self.cfg.openclaw_ws_fallback_url]:
+        for item in [self.preferred_openclaw_ws_url, self.cfg.openclaw_ws_url]:
             item = item.strip()
             if item and item not in urls:
                 urls.append(item)
@@ -389,7 +389,6 @@ class OpenClawGatewayMixin:
         ordered_sources = [
             self.preferred_openclaw_ws_url,
             self.cfg.openclaw_ws_url,
-            self.cfg.openclaw_ws_fallback_url,
         ]
         for item in ordered_sources:
             item = item.strip()
