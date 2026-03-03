@@ -3,6 +3,7 @@ import json
 import logging
 import time
 import uuid
+from collections import defaultdict, deque
 from typing import Any, cast
 
 import aiohttp
@@ -17,6 +18,14 @@ class OpenClawGatewayMixin:
     image_support_cache_until: float
     image_support_cache_value: bool | None
     image_support_model_desc: str
+    gateway_ws: aiohttp.ClientWebSocketResponse | None
+    gateway_ws_url: str
+    gateway_recv_task: asyncio.Task[Any] | None
+    gateway_connect_lock: asyncio.Lock
+    gateway_send_lock: asyncio.Lock
+    gateway_pending_reqs: dict[str, asyncio.Future[dict[str, Any]]]
+    gateway_run_payloads: defaultdict[str, deque[dict[str, Any]]]
+    gateway_run_waiters: dict[str, asyncio.Future[None]]
 
     @staticmethod
     def _to_json_dict(value: object) -> dict[str, Any] | None:
@@ -58,9 +67,263 @@ class OpenClawGatewayMixin:
             if item is None:
                 continue
             text_value = item.get("text")
-            if item.get("type") == "text" and isinstance(text_value, str):
+            if isinstance(text_value, str) and text_value:
                 chunks.append(text_value)
+                continue
+
+            # 兼容结构化 mention 片段，避免“只有@没有纯文本”时被判空回复。
+            seg_type = str(item.get("type", "")).strip().lower()
+            if seg_type in {"mention", "at", "user_mention", "mention_user"}:
+                mention_id = (
+                    item.get("qq")
+                    or item.get("userId")
+                    or item.get("user_id")
+                    or item.get("id")
+                )
+                if mention_id is not None:
+                    mention_text = f"[@{str(mention_id).strip()}]"
+                    if mention_text != "[@]":
+                        chunks.append(mention_text)
+                        continue
+
+            for alt_key in ("markdown", "content", "value", "name"):
+                alt_value = item.get(alt_key)
+                if isinstance(alt_value, str) and alt_value:
+                    chunks.append(alt_value)
+                    break
         return "".join(chunks).strip()
+
+    @staticmethod
+    def _extract_text_from_chat_payload(payload: dict[str, Any]) -> str:
+        message_raw = payload.get("message")
+        if isinstance(message_raw, str) and message_raw.strip():
+            return message_raw.strip()
+
+        message = OpenClawGatewayMixin._json_dict_or_empty(message_raw)
+        text = OpenClawGatewayMixin._extract_text_from_content(message.get("content"))
+        if text:
+            return text
+
+        for msg_key in ("text", "response", "outputText", "result"):
+            msg_value = message.get(msg_key)
+            if isinstance(msg_value, str) and msg_value.strip():
+                return msg_value.strip()
+
+        direct_text = payload.get("text")
+        if isinstance(direct_text, str) and direct_text.strip():
+            return direct_text.strip()
+
+        for key in ("response", "outputText", "result", "delta", "chunk", "answer"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    @staticmethod
+    def _event_effective_payload(packet: dict[str, Any]) -> dict[str, Any]:
+        payload = OpenClawGatewayMixin._json_dict_or_empty(packet.get("payload"))
+        data = OpenClawGatewayMixin._json_dict_or_empty(packet.get("data"))
+        merged: dict[str, Any] = {}
+
+        for source in (payload, data, packet):
+            for key in (
+                "runId",
+                "state",
+                "seq",
+                "sessionKey",
+                "message",
+                "text",
+                "response",
+                "outputText",
+                "result",
+                "delta",
+                "chunk",
+                "answer",
+            ):
+                if key in merged:
+                    continue
+                value = source.get(key)
+                if value is not None:
+                    merged[key] = value
+        return merged
+
+    async def _close_shared_gateway(self) -> None:
+        ws = self.gateway_ws
+        self.gateway_ws = None
+        self.gateway_ws_url = ""
+        task = self.gateway_recv_task
+        self.gateway_recv_task = None
+
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except BaseException:  # noqa: BLE001
+                pass
+
+        if ws is not None and not ws.closed:
+            await ws.close()
+
+    async def _shared_gateway_recv_loop(
+        self, ws: aiohttp.ClientWebSocketResponse, ws_url: str
+    ) -> None:
+        try:
+            while True:
+                packet = await self._ws_wait_text_json(ws, 60.0)
+                if packet is None:
+                    if ws.closed:
+                        break
+                    continue
+
+                p_type = packet.get("type")
+                if p_type == "res":
+                    req_id = str(packet.get("id", "")).strip()
+                    if req_id:
+                        fut = self.gateway_pending_reqs.pop(req_id, None)
+                        if fut is not None and not fut.done():
+                            fut.set_result(packet)
+                    continue
+
+                if p_type != "res":
+                    payload = self._event_effective_payload(packet)
+                    run_id = payload.get("runId")
+                    if isinstance(run_id, str) and run_id:
+                        queue = self.gateway_run_payloads[run_id]
+                        queue.append(payload)
+                        while len(queue) > 100:
+                            queue.popleft()
+                        waiter = self.gateway_run_waiters.pop(run_id, None)
+                        if waiter is not None and not waiter.done():
+                            waiter.set_result(None)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Shared OpenClaw gateway loop closed via=%s: %s", ws_url, exc)
+        finally:
+            if self.gateway_ws is ws:
+                self.gateway_ws = None
+                self.gateway_ws_url = ""
+            err = RuntimeError("Shared OpenClaw gateway disconnected")
+            for req_id, fut in list(self.gateway_pending_reqs.items()):
+                self.gateway_pending_reqs.pop(req_id, None)
+                if not fut.done():
+                    fut.set_exception(err)
+            for run_id, waiter in list(self.gateway_run_waiters.items()):
+                self.gateway_run_waiters.pop(run_id, None)
+                if not waiter.done():
+                    waiter.set_result(None)
+            if not ws.closed:
+                await ws.close()
+
+    async def _ensure_shared_gateway(self, ws_url: str) -> aiohttp.ClientWebSocketResponse:
+        assert self.session is not None
+        if (
+            self.gateway_ws is not None
+            and not self.gateway_ws.closed
+            and self.gateway_ws_url == ws_url
+        ):
+            return self.gateway_ws
+
+        async with self.gateway_connect_lock:
+            if (
+                self.gateway_ws is not None
+                and not self.gateway_ws.closed
+                and self.gateway_ws_url == ws_url
+            ):
+                return self.gateway_ws
+
+            await self._close_shared_gateway()
+
+            ws = await self.session.ws_connect(ws_url, heartbeat=25)
+            connect_req_id = str(uuid.uuid4())
+            deadline = asyncio.get_running_loop().time() + 15.0
+            connected = False
+
+            while not connected:
+                now = asyncio.get_running_loop().time()
+                if now >= deadline:
+                    await ws.close()
+                    raise TimeoutError("OpenClaw shared connect handshake timeout")
+                remaining = max(0.1, deadline - now)
+                packet = await self._ws_wait_text_json(ws, remaining)
+                if not packet:
+                    continue
+
+                if packet.get("type") == "event" and packet.get("event") == "connect.challenge":
+                    connect_params: dict[str, Any] = {
+                        "minProtocol": 3,
+                        "maxProtocol": 3,
+                        "client": {
+                            "id": self.cfg.openclaw_client_id,
+                            "version": "0.1.0",
+                            "platform": "linux",
+                            "mode": self.cfg.openclaw_client_mode,
+                        },
+                        "role": self.cfg.openclaw_role,
+                        "scopes": self._scopes_list(),
+                        "caps": [],
+                        "commands": [],
+                        "permissions": {},
+                        "auth": self._openclaw_auth_params(),
+                        "locale": "zh-CN",
+                        "userAgent": "llonebot-openclaw-bridge/0.1.0",
+                    }
+                    req: dict[str, Any] = {
+                        "type": "req",
+                        "id": connect_req_id,
+                        "method": "connect",
+                        "params": connect_params,
+                    }
+                    await ws.send_str(json.dumps(req, ensure_ascii=False))
+                    continue
+
+                if packet.get("type") == "res" and packet.get("id") == connect_req_id:
+                    if packet.get("ok") is True:
+                        connected = True
+                        break
+                    err = self._json_dict_or_empty(packet.get("error"))
+                    await ws.close()
+                    raise RuntimeError(
+                        f"OpenClaw shared connect failed: {err.get('code')} {err.get('message')}"
+                    )
+
+            self.gateway_ws = ws
+            self.gateway_ws_url = ws_url
+            self.gateway_recv_task = asyncio.create_task(self._shared_gateway_recv_loop(ws, ws_url))
+            return ws
+
+    async def _gateway_shared_request(
+        self, ws_url: str, method: str, params: dict[str, Any], timeout_sec: float
+    ) -> dict[str, Any]:
+        ws = await self._ensure_shared_gateway(ws_url)
+        req_id = str(uuid.uuid4())
+        req: dict[str, Any] = {
+            "type": "req",
+            "id": req_id,
+            "method": method,
+            "params": params,
+        }
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self.gateway_pending_reqs[req_id] = fut
+
+        try:
+            async with self.gateway_send_lock:
+                if self.gateway_ws is None or self.gateway_ws.closed or self.gateway_ws is not ws:
+                    raise RuntimeError("Shared OpenClaw gateway unavailable during send")
+                await ws.send_str(json.dumps(req, ensure_ascii=False))
+            packet = await asyncio.wait_for(fut, timeout=timeout_sec)
+        except Exception:
+            pending = self.gateway_pending_reqs.pop(req_id, None)
+            if pending is not None and not pending.done():
+                pending.cancel()
+            raise
+
+        if packet.get("ok") is not True:
+            err = self._json_dict_or_empty(packet.get("error"))
+            raise RuntimeError(
+                f"OpenClaw {method} failed: {err.get('code')} {err.get('message')}"
+            )
+        payload = self._json_dict_or_empty(packet.get("payload"))
+        return payload
 
     def _openclaw_full_session_key(self, session_key: str) -> str:
         if session_key.startswith("agent:"):
@@ -99,7 +362,10 @@ class OpenClawGatewayMixin:
     async def _ws_wait_text_json(
         self, ws: aiohttp.ClientWebSocketResponse, timeout_sec: float
     ) -> dict[str, Any] | None:
-        msg = await ws.receive(timeout=timeout_sec)
+        try:
+            msg = await ws.receive(timeout=timeout_sec)
+        except (asyncio.TimeoutError, TimeoutError):
+            return None
         if msg.type != aiohttp.WSMsgType.TEXT:
             return None
         try:
@@ -250,6 +516,91 @@ class OpenClawGatewayMixin:
         logging.warning("Image model capability probe failed: %s", last_err)
         return True, "unknown"
 
+    async def _wait_shared_run_result(
+        self,
+        run_id: str,
+        session_key: str,
+        ws_url: str,
+        timeout_sec: float,
+        initial_payload: dict[str, Any] | None = None,
+    ) -> str:
+        latest_text = ""
+        done = False
+        final_wait_deadline: float | None = None
+        final_text_grace_sec = 3.0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_sec
+
+        def consume(payload: dict[str, Any], source: str) -> None:
+            nonlocal latest_text, done, final_wait_deadline
+            text = self._extract_text_from_chat_payload(payload)
+            if text:
+                latest_text = text
+                final_wait_deadline = None
+            if payload.get("state") == "final":
+                if latest_text:
+                    done = True
+                else:
+                    logging.warning(
+                        "OpenClaw final event has no text (%s): key=%s run_id=%s payload_keys=%s",
+                        source,
+                        session_key,
+                        run_id,
+                        sorted(payload.keys()),
+                    )
+                    final_wait_deadline = loop.time() + final_text_grace_sec
+
+        if initial_payload:
+            consume(initial_payload, "ack")
+
+        while not done:
+            queue = self.gateway_run_payloads.get(run_id)
+            while queue and not done:
+                payload = queue.popleft()
+                consume(payload, "event")
+
+            if done:
+                break
+
+            now = loop.time()
+            if now >= deadline:
+                logging.warning(
+                    "OpenClaw run timeout waiting text: key=%s run_id=%s via=%s",
+                    session_key,
+                    run_id,
+                    ws_url,
+                )
+                break
+            if final_wait_deadline is not None and now >= final_wait_deadline:
+                break
+
+            remaining = max(0.1, deadline - now)
+            if final_wait_deadline is not None:
+                remaining = min(remaining, max(0.1, final_wait_deadline - now))
+
+            waiter: asyncio.Future[None] = loop.create_future()
+            self.gateway_run_waiters[run_id] = waiter
+            try:
+                await asyncio.wait_for(waiter, timeout=remaining)
+            except (asyncio.TimeoutError, TimeoutError):
+                pass
+            finally:
+                current = self.gateway_run_waiters.get(run_id)
+                if current is waiter:
+                    self.gateway_run_waiters.pop(run_id, None)
+
+        self.gateway_run_payloads.pop(run_id, None)
+        self.gateway_run_waiters.pop(run_id, None)
+        if latest_text:
+            return latest_text
+        logging.warning(
+            "OpenClaw run finished without text: key=%s run_id=%s via=%s",
+            session_key,
+            run_id,
+            ws_url,
+        )
+        return "我暂时没有收到有效回复，请稍后再试。"
+
     async def _ask_openclaw_once(
         self,
         ws_url: str,
@@ -257,157 +608,52 @@ class OpenClawGatewayMixin:
         user_text: str,
         attachments: list[dict[str, str]],
     ) -> str:
-        assert self.session is not None
         timeout = float(self.cfg.openclaw_timeout_sec)
+        chat_params: dict[str, Any] = {
+            "sessionKey": session_key,
+            "message": user_text,
+            # 开启 deliver，确保 Gateway 产生可消费的回复事件流，便于桥接实时转发到 OneBot。
+            "deliver": True,
+            "idempotencyKey": str(uuid.uuid4()),
+        }
+        if attachments:
+            chat_params["attachments"] = attachments
 
-        async with self.session.ws_connect(ws_url, heartbeat=25) as ws:
-            connect_req_id = str(uuid.uuid4())
-            chat_req_id = str(uuid.uuid4())
-            connect_deadline = asyncio.get_running_loop().time() + timeout
+        logging.info(
+            "OpenClaw chat.send via=%s key=%s attachments=%s",
+            ws_url,
+            session_key,
+            len(attachments),
+        )
+        payload = await self._gateway_shared_request(
+            ws_url,
+            "chat.send",
+            chat_params,
+            timeout_sec=min(20.0, timeout),
+        )
 
-            connected = False
-            while not connected:
-                now = asyncio.get_running_loop().time()
-                if now >= connect_deadline:
-                    raise TimeoutError("OpenClaw connect handshake timeout")
-                remaining = max(0.1, connect_deadline - now)
-                packet = await self._ws_wait_text_json(ws, remaining)
-                if not packet:
-                    continue
-
-                if packet.get("type") == "event" and packet.get("event") == "connect.challenge":
-                    connect_params: dict[str, Any] = {
-                        "minProtocol": 3,
-                        "maxProtocol": 3,
-                        "client": {
-                            "id": self.cfg.openclaw_client_id,
-                            "version": "0.1.0",
-                            "platform": "linux",
-                            "mode": self.cfg.openclaw_client_mode,
-                        },
-                        "role": self.cfg.openclaw_role,
-                        "scopes": self._scopes_list(),
-                        "caps": [],
-                        "commands": [],
-                        "permissions": {},
-                        "auth": self._openclaw_auth_params(),
-                        "locale": "zh-CN",
-                        "userAgent": "llonebot-openclaw-bridge/0.1.0",
-                    }
-                    req: dict[str, Any] = {
-                        "type": "req",
-                        "id": connect_req_id,
-                        "method": "connect",
-                        "params": connect_params,
-                    }
-                    await ws.send_str(json.dumps(req, ensure_ascii=False))
-                    continue
-
-                if packet.get("type") == "res" and packet.get("id") == connect_req_id:
-                    if packet.get("ok") is True:
-                        connected = True
-                        break
-                    err = self._json_dict_or_empty(packet.get("error"))
-                    raise RuntimeError(
-                        f"OpenClaw connect failed: {err.get('code')} {err.get('message')}"
-                    )
-
-            run_id: str | None = None
-            latest_text = ""
-            done = False
-            chat_acked = False
-            pending_chat_packets: list[dict[str, Any]] = []
-            end_deadline = asyncio.get_running_loop().time() + timeout
-
-            chat_params: dict[str, Any] = {
-                "sessionKey": session_key,
-                "message": user_text,
-                "deliver": False,
-                "idempotencyKey": str(uuid.uuid4()),
-            }
-            if attachments:
-                chat_params["attachments"] = attachments
-
-            chat_req: dict[str, Any] = {
-                "type": "req",
-                "id": chat_req_id,
-                "method": "chat.send",
-                "params": chat_params,
-            }
-            logging.info(
-                "OpenClaw chat.send via=%s key=%s attachments=%s",
-                ws_url,
+        run_id_value = payload.get("runId")
+        run_id = str(run_id_value).strip() if isinstance(run_id_value, str) else ""
+        if not run_id:
+            # 兜底：某些实现可能在 ack 里直接给最终文本但不给 runId。
+            text = self._extract_text_from_chat_payload(payload)
+            if text:
+                return text
+            logging.warning(
+                "OpenClaw chat.send ack missing runId and text: key=%s via=%s payload_keys=%s",
                 session_key,
-                len(attachments),
+                ws_url,
+                sorted(payload.keys()),
             )
-            await ws.send_str(json.dumps(chat_req, ensure_ascii=False))
-
-            while not done:
-                now = asyncio.get_running_loop().time()
-                if now >= end_deadline:
-                    raise TimeoutError("OpenClaw chat timeout")
-                remaining = max(0.1, end_deadline - now)
-                packet = await self._ws_wait_text_json(ws, remaining)
-                if not packet:
-                    continue
-
-                p_type = packet.get("type")
-                if p_type == "res" and packet.get("id") == chat_req_id:
-                    if packet.get("ok") is not True:
-                        err = self._json_dict_or_empty(packet.get("error"))
-                        raise RuntimeError(
-                            f"OpenClaw chat.send failed: {err.get('code')} {err.get('message')}"
-                        )
-                    chat_acked = True
-                    payload = self._json_dict_or_empty(packet.get("payload"))
-                    rid = payload.get("runId")
-                    if isinstance(rid, str) and rid:
-                        run_id = rid
-                    # chat.send ack 之前到达的 chat 事件先缓存，ack 后按 run_id 回放一次。
-                    while pending_chat_packets and not done:
-                        buffered = pending_chat_packets.pop(0)
-                        buffered_payload = self._json_dict_or_empty(buffered.get("payload"))
-                        buffered_run_id = buffered_payload.get("runId")
-                        if not isinstance(buffered_run_id, str) or not buffered_run_id:
-                            continue
-                        if run_id is None:
-                            run_id = buffered_run_id
-                        if run_id != buffered_run_id:
-                            continue
-
-                        message = self._json_dict_or_empty(buffered_payload.get("message"))
-                        text = self._extract_text_from_content(message.get("content"))
-                        if text:
-                            latest_text = text
-                        if buffered_payload.get("state") == "final":
-                            done = True
-                    continue
-
-                if p_type == "event" and packet.get("event") == "chat":
-                    # 先等到 chat.send ack，避免并发时误绑定到其他 run 的事件流。
-                    if not chat_acked:
-                        pending_chat_packets.append(packet)
-                        continue
-                    payload = self._json_dict_or_empty(packet.get("payload"))
-                    event_run_id = payload.get("runId")
-                    if not isinstance(event_run_id, str) or not event_run_id:
-                        continue
-                    if run_id is None:
-                        run_id = event_run_id
-                    if run_id != event_run_id:
-                        continue
-
-                    message = self._json_dict_or_empty(payload.get("message"))
-                    text = self._extract_text_from_content(message.get("content"))
-                    if text:
-                        latest_text = text
-                    if payload.get("state") == "final":
-                        done = True
-                        break
-
-            if latest_text:
-                return latest_text
             return "我暂时没有收到有效回复，请稍后再试。"
+
+        return await self._wait_shared_run_result(
+            run_id=run_id,
+            session_key=session_key,
+            ws_url=ws_url,
+            timeout_sec=timeout,
+            initial_payload=payload,
+        )
 
     async def _ask_openclaw(
         self, session_key: str, user_text: str, attachments: list[dict[str, str]]
@@ -430,6 +676,13 @@ class OpenClawGatewayMixin:
                 return result
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
-                logging.warning("OpenClaw connection via %s failed: %s", url, exc)
+                if self.gateway_ws_url == url:
+                    await self._close_shared_gateway()
+                logging.warning(
+                    "OpenClaw connection via %s failed: %s: %r",
+                    url,
+                    type(exc).__name__,
+                    exc,
+                )
 
         raise RuntimeError(f"OpenClaw unavailable: {last_err}")

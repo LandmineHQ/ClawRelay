@@ -20,6 +20,14 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self.bg_tasks: set[asyncio.Task[Any]] = set()
         self.seen_ids: deque[str] = deque(maxlen=2000)
         self.seen_set: set[str] = set()
+        self.gateway_ws: aiohttp.ClientWebSocketResponse | None = None
+        self.gateway_ws_url: str = ""
+        self.gateway_recv_task: asyncio.Task[Any] | None = None
+        self.gateway_connect_lock = asyncio.Lock()
+        self.gateway_send_lock = asyncio.Lock()
+        self.gateway_pending_reqs: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self.gateway_run_payloads: defaultdict[str, deque[dict[str, Any]]] = defaultdict(deque)
+        self.gateway_run_waiters: dict[str, asyncio.Future[None]] = {}
         self.pending_context: dict[str, deque[PendingObservation]] = defaultdict(
             lambda: deque(maxlen=max(2, self.cfg.context_observation_limit))
         )
