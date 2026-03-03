@@ -2,6 +2,10 @@
 import asyncio
 import logging
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from bridge_config import Config
 from bridge_core import OpenClawOneBotBridge
 
