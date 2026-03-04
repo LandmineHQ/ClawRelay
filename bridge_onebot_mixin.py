@@ -371,6 +371,12 @@ class OneBotMixin:
             return "/new"
         if normalized in {"/help", "help"}:
             return "/help"
+        if normalized.startswith("/pair ") or normalized in {"/pair", "/pairing"}:
+            return normalized
+        if normalized.startswith("/pairing "):
+            return normalized
+        if normalized.startswith("/op ") or normalized == "/op":
+            return normalized
         return None
 
     @staticmethod
@@ -378,7 +384,9 @@ class OneBotMixin:
         return (
             "可用指令：\n"
             "1) `/new`：重置当前会话上下文（开启新会话）\n"
-            "2) `/help`：查看指令说明"
+            "2) `/pair <配对码>`：OP 审批当前待配对会话（私聊/群聊）\n"
+            "3) `/op list|add|del`：OP 列表管理（仅 OP 可执行）\n"
+            "4) `/help`：查看指令说明"
         )
 
     def _build_prompt_from_pending(

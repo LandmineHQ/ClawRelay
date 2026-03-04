@@ -38,12 +38,24 @@ class Config:
     openclaw_scopes: str = os.getenv("OPENCLAW_SCOPES", "operator.read,operator.write")
     openclaw_timeout_sec: int = env_int("OPENCLAW_TIMEOUT_SEC", 180)
     openclaw_session_prefix: str = os.getenv("OPENCLAW_SESSION_PREFIX", "llonebot")
-    private_require_pairing: bool = env_bool("PRIVATE_REQUIRE_PAIRING", True)
-    private_pairing_code_len: int = env_int("PRIVATE_PAIRING_CODE_LEN", 8)
-    private_pairing_ttl_sec: int = env_int("PRIVATE_PAIRING_TTL_SEC", 3600)
-    private_pairing_store_path: str = os.getenv(
-        "PRIVATE_PAIRING_STORE_PATH", "./.bridge_private_pairing_users.json"
+    require_pairing: bool = env_bool(
+        "REQUIRE_PAIRING",
+        env_bool("PRIVATE_REQUIRE_PAIRING", True),
     )
+    pairing_code_len: int = env_int(
+        "PAIRING_CODE_LEN",
+        env_int("PRIVATE_PAIRING_CODE_LEN", 8),
+    )
+    pairing_ttl_sec: int = env_int(
+        "PAIRING_TTL_SEC",
+        env_int("PRIVATE_PAIRING_TTL_SEC", 3600),
+    )
+    pairing_store_path: str = os.getenv(
+        "PAIRING_STORE_PATH",
+        os.getenv("PRIVATE_PAIRING_STORE_PATH", "./.bridge_pairings.json"),
+    )
+    op_user_ids: str = os.getenv("OP_USER_IDS", "1216198007")
+    op_store_path: str = os.getenv("OP_STORE_PATH", "./.bridge_ops.json")
 
     request_timeout_sec: int = env_int("REQUEST_TIMEOUT_SEC", 200)
     reconnect_delay_sec: int = env_int("RECONNECT_DELAY_SEC", 3)

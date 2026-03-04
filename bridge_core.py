@@ -11,7 +11,7 @@ from typing import Any
 import aiohttp
 
 from bridge_config import Config
-from bridge_models import MessageImage, PendingObservation, PrivatePairingRequest
+from bridge_models import MessageImage, PairingRecord, PairingRequest, PendingObservation
 from bridge_onebot_mixin import OneBotMixin
 from bridge_openclaw_mixin import OpenClawGatewayMixin
 
@@ -35,8 +35,9 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self.gateway_relay_runs: set[str] = set()
         self.gateway_run_preferred_targets: dict[str, dict[str, Any]] = {}
         self.session_onebot_routes: dict[str, dict[str, Any]] = {}
-        self.private_pairing_verified_users: set[str] = set()
-        self.private_pairing_pending: dict[str, PrivatePairingRequest] = {}
+        self.op_users: set[str] = set()
+        self.pairing_approved: dict[str, PairingRecord] = {}
+        self.pairing_pending: dict[str, PairingRequest] = {}
         self.pending_context: dict[str, deque[PendingObservation]] = defaultdict(
             lambda: deque(maxlen=max(2, self.cfg.context_observation_limit))
         )
@@ -45,7 +46,8 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self.image_support_cache_until: float = 0.0
         self.image_support_cache_value: bool | None = None
         self.image_support_model_desc: str = "unknown"
-        self._load_private_pairing_store()
+        self._load_ops_store()
+        self._load_pairing_store()
 
     def _discard_bg_task(self, task: asyncio.Task[Any]) -> None:
         self.bg_tasks.discard(task)
@@ -78,67 +80,194 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         # Exclude ambiguous characters: 0/O and 1/I.
         return "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 
-    def _private_pairing_store_path(self) -> str:
-        path = self.cfg.private_pairing_store_path.strip()
-        return path or "./.bridge_private_pairing_users.json"
+    @staticmethod
+    def _normalize_user_id(value: Any) -> str:
+        return str(value or "").strip()
 
-    def _load_private_pairing_store(self) -> None:
-        path = self._private_pairing_store_path()
+    def _ops_store_path(self) -> str:
+        path = self.cfg.op_store_path.strip()
+        return path or "./.bridge_ops.json"
+
+    def _pairing_store_path(self) -> str:
+        path = self.cfg.pairing_store_path.strip()
+        return path or "./.bridge_pairings.json"
+
+    def _ops_from_env(self) -> set[str]:
+        users = {
+            self._normalize_user_id(uid)
+            for uid in self.cfg.op_user_ids.split(",")
+            if self._normalize_user_id(uid)
+        }
+        if not users:
+            users.add("1216198007")
+        return users
+
+    def _load_ops_store(self) -> None:
+        path = self._ops_store_path()
+        users = set(self._ops_from_env())
         try:
-            if not os.path.exists(path):
-                return
-            with open(path, "r", encoding="utf-8") as f:
-                parsed = json.load(f)
-            users: set[str] = set()
-            if isinstance(parsed, dict):
-                users_value = parsed.get("users")
-                if isinstance(users_value, dict):
-                    users = {str(uid).strip() for uid in users_value.keys() if str(uid).strip()}
-                else:
-                    users = {
-                        str(uid).strip()
-                        for uid in parsed.keys()
-                        if str(uid).strip() and str(uid) != "version"
-                    }
-            self.private_pairing_verified_users = users
-            if users:
-                logging.info("Loaded private pairing users: %s from %s", len(users), path)
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    parsed = json.load(f)
+                if isinstance(parsed, dict):
+                    users_value = parsed.get("users")
+                    if isinstance(users_value, dict):
+                        users.update(
+                            self._normalize_user_id(uid)
+                            for uid in users_value.keys()
+                            if self._normalize_user_id(uid)
+                        )
+                    elif isinstance(users_value, list):
+                        users.update(
+                            self._normalize_user_id(uid)
+                            for uid in users_value
+                            if self._normalize_user_id(uid)
+                        )
+            self.op_users = {uid for uid in users if uid}
+            if not self.op_users:
+                self.op_users = {"1216198007"}
+            logging.info("Loaded OP users: %s from %s", len(self.op_users), path)
+            self._save_ops_store()
         except Exception as exc:  # noqa: BLE001
-            logging.warning("Failed to load private pairing store %s: %s", path, exc)
+            logging.warning("Failed to load OP store %s: %s", path, exc)
+            if not self.op_users:
+                self.op_users = {"1216198007"}
 
-    def _save_private_pairing_store(self) -> None:
-        path = self._private_pairing_store_path()
+    def _save_ops_store(self) -> None:
+        path = self._ops_store_path()
         try:
             folder = os.path.dirname(path)
             if folder:
                 os.makedirs(folder, exist_ok=True)
-
-            users_payload = {uid: True for uid in sorted(self.private_pairing_verified_users)}
             payload: dict[str, Any] = {
                 "version": 1,
-                "users": users_payload,
+                "users": {uid: True for uid in sorted(self.op_users)},
                 "updatedAt": int(time.time()),
             }
-
             tmp_path = f"{path}.tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, path)
         except Exception as exc:  # noqa: BLE001
-            logging.warning("Failed to save private pairing store %s: %s", path, exc)
+            logging.warning("Failed to save OP store %s: %s", path, exc)
 
-    def _private_pairing_code_len(self) -> int:
-        return max(4, min(12, int(self.cfg.private_pairing_code_len)))
+    def _load_pairing_store(self) -> None:
+        path = self._pairing_store_path()
+        records: dict[str, PairingRecord] = {}
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    parsed = json.load(f)
+                if isinstance(parsed, dict):
+                    records_value = parsed.get("records")
+                    if isinstance(records_value, dict):
+                        for raw_key, raw_item in records_value.items():
+                            if not isinstance(raw_item, dict):
+                                continue
+                            target_type = str(raw_item.get("targetType") or "").strip().lower()
+                            target_id = str(raw_item.get("targetId") or "").strip()
+                            approved_by = str(raw_item.get("approvedByUserId") or "").strip()
+                            approved_at_raw = raw_item.get("approvedAt")
+                            try:
+                                approved_at = int(approved_at_raw) if approved_at_raw is not None else 0
+                            except (TypeError, ValueError):
+                                approved_at = 0
+                            if target_type not in {"user", "group"} or not target_id:
+                                continue
+                            key = str(raw_key).strip() or f"{target_type}:{target_id}"
+                            records[key] = PairingRecord(
+                                target_type=target_type,
+                                target_id=target_id,
+                                approved_by_user_id=approved_by,
+                                approved_at=approved_at or int(time.time()),
+                            )
 
-    def _private_pairing_ttl_sec(self) -> int:
-        return max(60, int(self.cfg.private_pairing_ttl_sec))
+                    # Backward compatibility for older private pairing payload.
+                    users_value = parsed.get("users")
+                    if isinstance(users_value, dict):
+                        for uid in users_value.keys():
+                            user_id = self._normalize_user_id(uid)
+                            if not user_id:
+                                continue
+                            key = f"user:{user_id}"
+                            records.setdefault(
+                                key,
+                                PairingRecord(
+                                    target_type="user",
+                                    target_id=user_id,
+                                    approved_by_user_id="legacy",
+                                    approved_at=int(time.time()),
+                                ),
+                            )
+            self.pairing_approved = records
+            if records:
+                logging.info("Loaded pairing records: %s from %s", len(records), path)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to load pairing store %s: %s", path, exc)
+
+    def _save_pairing_store(self) -> None:
+        path = self._pairing_store_path()
+        try:
+            folder = os.path.dirname(path)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            payload_records: dict[str, dict[str, Any]] = {}
+            for key, record in sorted(self.pairing_approved.items()):
+                payload_records[key] = {
+                    "targetType": record.target_type,
+                    "targetId": record.target_id,
+                    "approvedByUserId": record.approved_by_user_id,
+                    "approvedAt": int(record.approved_at),
+                }
+            payload: dict[str, Any] = {
+                "version": 1,
+                "records": payload_records,
+                "updatedAt": int(time.time()),
+            }
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to save pairing store %s: %s", path, exc)
+
+    def _pairing_code_len(self) -> int:
+        return max(4, min(12, int(self.cfg.pairing_code_len)))
+
+    def _pairing_ttl_sec(self) -> int:
+        return max(60, int(self.cfg.pairing_ttl_sec))
+
+    def _pairing_target_from_event(self, event: dict[str, Any]) -> tuple[str, str, str] | None:
+        message_type = str(event.get("message_type", "")).strip()
+        if message_type == "private":
+            target_type = "user"
+            target_id = self._normalize_user_id(event.get("user_id"))
+        elif message_type == "group":
+            target_type = "group"
+            target_id = self._normalize_user_id(event.get("group_id"))
+        else:
+            return None
+        if not target_id:
+            return None
+        return target_type, target_id, f"{target_type}:{target_id}"
+
+    def _pairing_target_session_key(self, target_type: str, target_id: str) -> str:
+        if target_type == "user":
+            return f"{self.cfg.openclaw_session_prefix}:private:{target_id}"
+        return f"{self.cfg.openclaw_session_prefix}:group:{target_id}"
 
     @staticmethod
-    def _private_user_id(event: dict[str, Any]) -> str:
-        return str(event.get("user_id", "")).strip()
+    def _pairing_target_display(target_type: str, target_id: str) -> str:
+        if target_type == "user":
+            return f"私聊用户 {target_id}"
+        return f"群 {target_id}"
+
+    def _is_op_user(self, user_id: str) -> bool:
+        uid = self._normalize_user_id(user_id)
+        return bool(uid and uid in self.op_users)
 
     def _extract_pairing_candidate(self, text: str) -> str:
-        code_len = self._private_pairing_code_len()
+        code_len = self._pairing_code_len()
         normalized = re.sub(r"[^A-Za-z0-9]", "", (text or "").upper())
         if len(normalized) == code_len:
             return normalized
@@ -146,71 +275,65 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         matched = token_pattern.search((text or "").upper())
         return matched.group(0) if matched else ""
 
-    def _issue_private_pairing_request(self, user_id: str) -> PrivatePairingRequest:
+    def _issue_pairing_request(
+        self, target_key: str, requester_user_id: str, requester_message_type: str
+    ) -> PairingRequest:
         charset = self._pairing_charset()
-        code_len = self._private_pairing_code_len()
+        code_len = self._pairing_code_len()
         code = "".join(secrets.choice(charset) for _ in range(code_len))
-        req = PrivatePairingRequest(code=code, expires_at=time.time() + self._private_pairing_ttl_sec())
-        self.private_pairing_pending[user_id] = req
+        req = PairingRequest(
+            code=code,
+            expires_at=time.time() + self._pairing_ttl_sec(),
+            requester_user_id=requester_user_id,
+            requester_message_type=requester_message_type,
+        )
+        self.pairing_pending[target_key] = req
         return req
 
-    async def _ensure_private_pairing(
-        self, event: dict[str, Any], session_key: str, text: str
-    ) -> bool:
-        if not self.cfg.private_require_pairing:
-            return True
-        if event.get("message_type") != "private":
+    def _find_pending_pairing_by_code(self, code: str) -> tuple[str, PairingRequest] | None:
+        now = time.time()
+        for target_key, req in list(self.pairing_pending.items()):
+            if req.expires_at <= now:
+                self.pairing_pending.pop(target_key, None)
+                continue
+            if req.code == code:
+                return target_key, req
+        return None
+
+    async def _ensure_target_pairing(self, event: dict[str, Any], session_key: str) -> bool:
+        if not self.cfg.require_pairing:
             return True
 
-        user_id = self._private_user_id(event)
-        if not user_id:
+        target = self._pairing_target_from_event(event)
+        if target is None:
             return False
-        if user_id in self.private_pairing_verified_users:
+        target_type, target_id, target_key = target
+
+        if target_key in self.pairing_approved:
             return True
 
         now = time.time()
-        pending = self.private_pairing_pending.get(user_id)
+        pending = self.pairing_pending.get(target_key)
         if pending is not None and pending.expires_at <= now:
-            self.private_pairing_pending.pop(user_id, None)
+            self.pairing_pending.pop(target_key, None)
             pending = None
 
-        candidate = self._extract_pairing_candidate(text)
-        if pending is not None:
-            if candidate and candidate == pending.code:
-                self.private_pairing_verified_users.add(user_id)
-                self._save_private_pairing_store()
-                self.private_pairing_pending.pop(user_id, None)
-                self.session_prompt_bootstrapped.discard(session_key)
-                await self._send_onebot_reply(
-                    event,
-                    "配对成功，当前私聊会话已绑定 OpenClaw。请继续发送你的问题。",
-                )
-                return False
-            if candidate:
-                await self._send_onebot_reply(
-                    event,
-                    (
-                        f"配对码不正确。请回复正确的配对码：{pending.code}\n"
-                        f"配对码有效期至 {time.strftime('%H:%M:%S', time.localtime(pending.expires_at))}。"
-                    ),
-                )
-                return False
-            await self._send_onebot_reply(
-                event,
-                (
-                    f"当前私聊尚未配对。请回复配对码：{pending.code}\n"
-                    f"配对码有效期至 {time.strftime('%H:%M:%S', time.localtime(pending.expires_at))}。"
-                ),
-            )
-            return False
+        if pending is None:
+            requester_user_id = self._normalize_user_id(event.get("user_id"))
+            requester_message_type = str(event.get("message_type", "")).strip()
+            pending = self._issue_pairing_request(target_key, requester_user_id, requester_message_type)
+            self.session_prompt_bootstrapped.discard(session_key)
 
-        req = self._issue_private_pairing_request(user_id)
+        op_list = ", ".join(sorted(self.op_users)) if self.op_users else "（空）"
+        target_display = self._pairing_target_display(target_type, target_id)
         await self._send_onebot_reply(
             event,
             (
-                "当前私聊需要先进行配对认证。\n"
-                f"请回复以下配对码完成绑定：{req.code}\n"
-                f"配对码有效期至 {time.strftime('%H:%M:%S', time.localtime(req.expires_at))}。"
+                f"当前会话（{target_display}）尚未通过 OP 配对审批，暂不转发到 OpenClaw。\n"
+                f"配对码：{pending.code}\n"
+                f"请由 OP 执行：`/pair {pending.code}`\n"
+                f"配对码有效期至 {time.strftime('%H:%M:%S', time.localtime(pending.expires_at))}。\n"
+                f"当前 OP：{op_list}"
             ),
         )
         return False
@@ -319,16 +442,134 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self.bg_tasks.add(task)
         task.add_done_callback(self._discard_bg_task)
 
+    @staticmethod
+    def _normalize_command_text(command: str) -> str:
+        normalized = (command or "").strip().lower().replace("／", "/")
+        if normalized.startswith("\\"):
+            normalized = "/" + normalized[1:]
+        return re.sub(r"\s+", " ", normalized)
+
+    def _command_user_id(self, event: dict[str, Any]) -> str:
+        return self._normalize_user_id(event.get("user_id"))
+
+    async def _ensure_op_permission(self, event: dict[str, Any], command_name: str) -> bool:
+        user_id = self._command_user_id(event)
+        if self._is_op_user(user_id):
+            return True
+        if event.get("message_type") == "group":
+            await self._send_onebot_reply(
+                event, f"仅 OP 可在群聊中执行 `{command_name}`。你的 user_id={user_id or 'unknown'}。"
+            )
+            return False
+        await self._send_onebot_reply(
+            event, f"仅 OP 可执行 `{command_name}`。你的 user_id={user_id or 'unknown'}。"
+        )
+        return False
+
+    @staticmethod
+    def _extract_user_id_from_command(command: str) -> str:
+        matched = re.search(r"\d{5,20}", command or "")
+        return matched.group(0) if matched else ""
+
+    @staticmethod
+    def _is_admin_command(command: str) -> bool:
+        normalized = OpenClawOneBotBridge._normalize_command_text(command)
+        return normalized.startswith("/pair") or normalized.startswith("/op")
+
+    async def _handle_pair_command(self, event: dict[str, Any], command: str) -> None:
+        if not await self._ensure_op_permission(event, "/pair"):
+            return
+        code = self._extract_pairing_candidate(command)
+        if not code:
+            await self._send_onebot_reply(event, "用法：`/pair <配对码>`")
+            return
+        found = self._find_pending_pairing_by_code(code)
+        if found is None:
+            await self._send_onebot_reply(event, f"未找到可用配对码：{code}（可能已过期）。")
+            return
+
+        target_key, _req = found
+        target_parts = target_key.split(":", 1)
+        if len(target_parts) != 2:
+            await self._send_onebot_reply(event, f"配对目标异常：{target_key}")
+            return
+        target_type, target_id = target_parts
+        approver = self._command_user_id(event) or "unknown"
+        approved_at = int(time.time())
+        self.pairing_approved[target_key] = PairingRecord(
+            target_type=target_type,
+            target_id=target_id,
+            approved_by_user_id=approver,
+            approved_at=approved_at,
+        )
+        self.pairing_pending.pop(target_key, None)
+        self._save_pairing_store()
+        target_session_key = self._pairing_target_session_key(target_type, target_id)
+        self.session_prompt_bootstrapped.discard(target_session_key)
+        await self._send_onebot_reply(
+            event,
+            (
+                f"配对已通过：{self._pairing_target_display(target_type, target_id)}\n"
+                f"审批人：{approver}\n"
+                f"审批时间：{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(approved_at))}"
+            ),
+        )
+
+    async def _handle_op_command(self, event: dict[str, Any], command: str) -> None:
+        if not await self._ensure_op_permission(event, "/op"):
+            return
+        normalized = self._normalize_command_text(command)
+        parts = [p for p in normalized.split(" ") if p]
+        if len(parts) <= 1 or parts[1] in {"list", "ls"}:
+            op_list = ", ".join(sorted(self.op_users)) if self.op_users else "（空）"
+            await self._send_onebot_reply(event, f"当前 OP 列表：{op_list}")
+            return
+
+        action = parts[1]
+        if action in {"add", "+"}:
+            target_uid = self._extract_user_id_from_command(normalized)
+            if not target_uid:
+                await self._send_onebot_reply(event, "用法：`/op add <user_id>`")
+                return
+            if target_uid in self.op_users:
+                await self._send_onebot_reply(event, f"user_id={target_uid} 已是 OP。")
+                return
+            self.op_users.add(target_uid)
+            self._save_ops_store()
+            await self._send_onebot_reply(event, f"已添加 OP：{target_uid}")
+            return
+
+        if action in {"del", "remove", "rm", "-"}:
+            target_uid = self._extract_user_id_from_command(normalized)
+            if not target_uid:
+                await self._send_onebot_reply(event, "用法：`/op del <user_id>`")
+                return
+            if target_uid not in self.op_users:
+                await self._send_onebot_reply(event, f"user_id={target_uid} 不在 OP 列表中。")
+                return
+            if len(self.op_users) <= 1:
+                await self._send_onebot_reply(event, "至少需要保留 1 个 OP，无法删除最后一个。")
+                return
+            self.op_users.discard(target_uid)
+            self._save_ops_store()
+            await self._send_onebot_reply(event, f"已移除 OP：{target_uid}")
+            return
+
+        await self._send_onebot_reply(
+            event,
+            "用法：`/op list`、`/op add <user_id>`、`/op del <user_id>`",
+        )
+
     async def _handle_local_command(
         self, event: dict[str, Any], session_key: str, command: str
     ) -> None:
-        cmd = command.strip().lower()
-        if cmd == "/help":
+        cmd = self._normalize_command_text(command)
+        if cmd in {"/help", "help"}:
             await self._send_onebot_reply(event, self._help_text())
             return
 
-        if cmd == "/new":
-            if not await self._ensure_private_pairing(event, session_key, command):
+        if cmd in {"/new", "new"}:
+            if not await self._ensure_target_pairing(event, session_key):
                 return
             # 清除桥接侧暂存上下文，并重置 OpenClaw 会话。
             self.pending_context[session_key].clear()
@@ -341,6 +582,14 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                     event,
                     f"会话重置失败：{err}\n请检查 OpenClaw token/scopes（需要 operator.admin）。",
                 )
+            return
+
+        if cmd.startswith("/pair ") or cmd == "/pair" or cmd.startswith("/pairing"):
+            await self._handle_pair_command(event, command)
+            return
+
+        if cmd.startswith("/op ") or cmd == "/op":
+            await self._handle_op_command(event, command)
 
     async def _process_message(
         self,
@@ -425,7 +674,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
 
         should_reply, latest_text = self._should_reply(event, parsed)
         local_cmd = self._detect_local_command(latest_text, parsed.images)
-        if should_reply and local_cmd:
+        if local_cmd and (should_reply or self._is_admin_command(local_cmd)):
             await self._handle_local_command(event, session_key, local_cmd)
             return
 
@@ -433,7 +682,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         if event.get("message_type") == "private":
             if not should_reply:
                 return
-            if not await self._ensure_private_pairing(event, session_key, latest_text):
+            if not await self._ensure_target_pairing(event, session_key):
                 return
             task = asyncio.create_task(
                 self._process_message(
@@ -449,6 +698,8 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
 
         self._record_observation(event, session_key, normalized_text, parsed.images)
         if not should_reply:
+            return
+        if not await self._ensure_target_pairing(event, session_key):
             return
 
         pending = list(self.pending_context[session_key])

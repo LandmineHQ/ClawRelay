@@ -27,6 +27,16 @@ class PendingObservation:
 
 
 @dataclass
-class PrivatePairingRequest:
+class PairingRequest:
     code: str
     expires_at: float
+    requester_user_id: str = ""
+    requester_message_type: str = ""
+
+
+@dataclass
+class PairingRecord:
+    target_type: str
+    target_id: str
+    approved_by_user_id: str
+    approved_at: int
