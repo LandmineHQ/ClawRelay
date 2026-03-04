@@ -1,5 +1,4 @@
 .env
-.bridge_private_pairing_users.json
 .bridge_pairings.json
 .bridge_ops.json
 

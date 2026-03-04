@@ -181,24 +181,6 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                                 approved_by_user_id=approved_by,
                                 approved_at=approved_at or int(time.time()),
                             )
-
-                    # Backward compatibility for older private pairing payload.
-                    users_value = parsed.get("users")
-                    if isinstance(users_value, dict):
-                        for uid in users_value.keys():
-                            user_id = self._normalize_user_id(uid)
-                            if not user_id:
-                                continue
-                            key = f"user:{user_id}"
-                            records.setdefault(
-                                key,
-                                PairingRecord(
-                                    target_type="user",
-                                    target_id=user_id,
-                                    approved_by_user_id="legacy",
-                                    approved_at=int(time.time()),
-                                ),
-                            )
             self.pairing_approved = records
             if records:
                 logging.info("Loaded pairing records: %s from %s", len(records), path)

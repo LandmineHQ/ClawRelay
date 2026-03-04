@@ -40,19 +40,19 @@ class Config:
     openclaw_session_prefix: str = os.getenv("OPENCLAW_SESSION_PREFIX", "llonebot")
     require_pairing: bool = env_bool(
         "REQUIRE_PAIRING",
-        env_bool("PRIVATE_REQUIRE_PAIRING", True),
+        True,
     )
     pairing_code_len: int = env_int(
         "PAIRING_CODE_LEN",
-        env_int("PRIVATE_PAIRING_CODE_LEN", 8),
+        8,
     )
     pairing_ttl_sec: int = env_int(
         "PAIRING_TTL_SEC",
-        env_int("PRIVATE_PAIRING_TTL_SEC", 3600),
+        3600,
     )
     pairing_store_path: str = os.getenv(
         "PAIRING_STORE_PATH",
-        os.getenv("PRIVATE_PAIRING_STORE_PATH", "./.bridge_pairings.json"),
+        "./.bridge_pairings.json",
     )
     op_user_ids: str = os.getenv("OP_USER_IDS", "1216198007")
     op_store_path: str = os.getenv("OP_STORE_PATH", "./.bridge_ops.json")
