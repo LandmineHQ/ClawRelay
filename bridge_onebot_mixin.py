@@ -344,6 +344,16 @@ class OneBotMixin:
             return text, False
         return text[matched.end() :].strip(), True
 
+    @staticmethod
+    def _extract_op_target_user_id(arg: str) -> str:
+        raw = (arg or "").strip()
+        if re.fullmatch(r"\d{5,20}", raw):
+            return raw
+        cq_match = re.fullmatch(r"\[cq:at,[^\]]*qq=(\d{5,20})[^\]]*\]", raw, flags=re.IGNORECASE)
+        if cq_match:
+            return cq_match.group(1)
+        return ""
+
     def _detect_local_command(self, text: str, images: list[MessageImage]) -> str | None:
         if images:
             return None
@@ -379,13 +389,17 @@ class OneBotMixin:
         if re.fullmatch(r"/?op(?:\s+(?:list|ls))?", normalized):
             return "/op list"
 
-        op_add_matched = re.fullmatch(r"/?op\s+(?:add|\+)\s+(\d{5,20})", normalized)
+        op_add_matched = re.fullmatch(r"/?op\s+(?:add|\+)\s+(.+)", normalized)
         if op_add_matched:
-            return f"/op add {op_add_matched.group(1)}"
+            target_uid = OneBotMixin._extract_op_target_user_id(op_add_matched.group(1))
+            if target_uid:
+                return f"/op add {target_uid}"
 
-        op_del_matched = re.fullmatch(r"/?op\s+(?:del|remove|rm|-)\s+(\d{5,20})", normalized)
+        op_del_matched = re.fullmatch(r"/?op\s+(?:del|remove|rm|-)\s+(.+)", normalized)
         if op_del_matched:
-            return f"/op del {op_del_matched.group(1)}"
+            target_uid = OneBotMixin._extract_op_target_user_id(op_del_matched.group(1))
+            if target_uid:
+                return f"/op del {target_uid}"
 
         return None
 

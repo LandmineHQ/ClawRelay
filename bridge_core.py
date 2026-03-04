@@ -450,6 +450,13 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
 
     @staticmethod
     def _extract_user_id_from_command(command: str) -> str:
+        cq_matched = re.search(
+            r"\[cq:at,[^\]]*qq=(\d{5,20})[^\]]*\]",
+            command or "",
+            flags=re.IGNORECASE,
+        )
+        if cq_matched:
+            return cq_matched.group(1)
         matched = re.search(r"\d{5,20}", command or "")
         return matched.group(0) if matched else ""
 
