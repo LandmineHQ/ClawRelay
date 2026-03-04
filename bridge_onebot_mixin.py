@@ -344,8 +344,7 @@ class OneBotMixin:
             return text, False
         return text[matched.end() :].strip(), True
 
-    @staticmethod
-    def _detect_local_command(text: str, images: list[MessageImage]) -> str | None:
+    def _detect_local_command(self, text: str, images: list[MessageImage]) -> str | None:
         if images:
             return None
         stripped = (text or "").strip()
@@ -371,12 +370,23 @@ class OneBotMixin:
             return "/new"
         if normalized in {"/help", "help"}:
             return "/help"
-        if normalized.startswith("/pair ") or normalized in {"/pair", "/pairing"}:
-            return normalized
-        if normalized.startswith("/pairing "):
-            return normalized
-        if normalized.startswith("/op ") or normalized == "/op":
-            return normalized
+
+        code_len = max(4, min(12, int(self.cfg.pairing_code_len)))
+        pair_matched = re.fullmatch(rf"/?(?:pair|pairing)\s+([a-z0-9]{{{code_len}}})", normalized)
+        if pair_matched:
+            return f"/pair {pair_matched.group(1).upper()}"
+
+        if re.fullmatch(r"/?op(?:\s+(?:list|ls))?", normalized):
+            return "/op list"
+
+        op_add_matched = re.fullmatch(r"/?op\s+(?:add|\+)\s+(\d{5,20})", normalized)
+        if op_add_matched:
+            return f"/op add {op_add_matched.group(1)}"
+
+        op_del_matched = re.fullmatch(r"/?op\s+(?:del|remove|rm|-)\s+(\d{5,20})", normalized)
+        if op_del_matched:
+            return f"/op del {op_del_matched.group(1)}"
+
         return None
 
     @staticmethod

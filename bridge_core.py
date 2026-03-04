@@ -456,7 +456,11 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
     @staticmethod
     def _is_admin_command(command: str) -> bool:
         normalized = OpenClawOneBotBridge._normalize_command_text(command)
-        return normalized.startswith("/pair") or normalized.startswith("/op")
+        if re.fullmatch(r"/?pair [a-z0-9]{4,12}", normalized):
+            return True
+        if re.fullmatch(r"/?op (?:list|add \d{5,20}|del \d{5,20})", normalized):
+            return True
+        return False
 
     async def _handle_pair_command(self, event: dict[str, Any], command: str) -> None:
         if not await self._ensure_op_permission(event, "/pair"):
@@ -566,11 +570,11 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 )
             return
 
-        if cmd.startswith("/pair ") or cmd == "/pair" or cmd.startswith("/pairing"):
+        if re.fullmatch(r"/?pair [a-z0-9]{4,12}", cmd):
             await self._handle_pair_command(event, command)
             return
 
-        if cmd.startswith("/op ") or cmd == "/op":
+        if re.fullmatch(r"/?op (?:list|add \d{5,20}|del \d{5,20})", cmd):
             await self._handle_op_command(event, command)
 
     async def _process_message(
