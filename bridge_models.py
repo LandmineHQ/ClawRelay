@@ -20,3 +20,5 @@ class PendingObservation:
     normalized_text: str
     images: list[MessageImage]
     ts: float
+    sender_name: str = ""
+    sender_id: str = ""

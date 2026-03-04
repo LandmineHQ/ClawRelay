@@ -193,11 +193,20 @@ class OneBotMixin:
         sender_name: str, sender_qq: str, normalized_text: str, images: list[MessageImage], ts: float
     ) -> str:
         display = normalized_text or "（无文本）"
-        # if images:
-        #     refs = [os.path.basename(img.file.strip()) if img.file.strip() else "unknown" for img in images]
-        #     display = f"{display} | 图片哈希: {', '.join(refs)}"
+        # Keep a compact fallback line for logs/debug.
         time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
         return f"{time_str} {sender_name}({sender_qq}): {display}"
+
+    @staticmethod
+    def _format_observation_item(obs: PendingObservation) -> str:
+        display = obs.normalized_text or "（无文本）"
+        time_str = datetime.fromtimestamp(obs.ts).strftime("%H:%M:%S")
+        return (
+            f"- time: {time_str}\n"
+            f"  user_name: {obs.sender_name or 'unknown'}\n"
+            f"  user_id: {obs.sender_id or 'unknown'}\n"
+            f"  content: {display}"
+        )
 
     def _record_observation(
         self, event: dict[str, Any], session_key: str, normalized_text: str, images: list[MessageImage]
@@ -216,6 +225,8 @@ class OneBotMixin:
                 normalized_text=normalized_text,
                 images=list(images),
                 ts=ts,
+                sender_name=sender_name,
+                sender_id=sender_qq,
             )
         )
 
@@ -308,34 +319,52 @@ class OneBotMixin:
         recent = pending[-max(1, self.cfg.context_flush_limit) :]
         # 触发消息会先写入 pending，这里将历史与当前待回复消息拆开，避免重复占用 token。
         history = recent[:-1] if len(recent) > 1 else []
-        current_line = latest_line.strip() or (recent[-1].line if recent else "unknown(unknown): （无）")
-        history_lines = [f"{i + 1}. {item.line}" for i, item in enumerate(history)]
-        history_block = "\n".join(history_lines) if history_lines else "（无）"
+        latest_obs = recent[-1] if recent else None
+        current_sender_id = latest_obs.sender_id if latest_obs is not None else "unknown"
+        if latest_obs is not None:
+            current_block = self._format_observation_item(latest_obs)
+        else:
+            current_block = (
+                "- time: unknown\n"
+                "  user_name: unknown\n"
+                "  user_id: unknown\n"
+                f"  content: {latest_line.strip() or '（无文本）'}"
+            )
+
+        history_lines = [self._format_observation_item(item) for item in history]
+        history_block = "\n\n".join(history_lines) if history_lines else "（无）"
+
+        rule_block = (
+            "规则：\n"
+            "1) user_name 可能包含数字（例如“我是1354987”），这不是 QQ 号。\n"
+            "2) 只能使用 user_id 作为 QQ 号；如需@，仅可输出 `[CQ:at,qq=<user_id>]`。\n"
+            "3) 默认不@，除非明确需要点名。\n"
+            f"4) 当前待回复消息发送者 user_id: {current_sender_id}\n"
+            "5) 默认使用简洁纯文本回复；仅当用户明确要求 Markdown 时，才使用 Markdown。"
+        )
         if not include_guidance:
             return (
-                "历史记录（不含当前消息）：\n"
+                "历史记录（不含当前消息，每条分行结构化字段）：\n"
                 + "```text\n"
                 + history_block
                 + "\n```\n"
                 + "当前待回复消息：\n"
                 + "```text\n"
-                + current_line
+                + current_block
                 + "\n```\n"
-                + "回复要求：仅输出纯文本，不要使用 Markdown 格式（不要使用代码块、标题、列表、加粗等）。"
+                + rule_block
             )
         return (
             "你正在 QQ 群聊中对话，请结合历史继续当前话题并直接回复用户。\n"
-            + "历史记录（不含当前消息，按时间顺序）：\n"
+            + "历史记录（不含当前消息，按时间顺序，每条分行结构化字段）：\n"
             + "```text\n"
             + history_block
             + "\n```\n"
             + "当前待回复消息：\n"
             + "```text\n"
-            + current_line
+            + current_block
             + "\n```\n"
-            + "说明：消息中的@以 OneBot CQ 码表示（例如 `[CQ:at,qq=123456]`）。"
-            + "如果需要@某人，请在回复中输出对应的 CQ 码，或使用 `[@123456]`。"
-            + "回复要求：仅输出纯文本，不要使用 Markdown 格式（不要使用代码块、标题、列表、加粗等）。"
+            + rule_block
         )
 
     def _collect_recent_images(self, pending: list[PendingObservation]) -> list[MessageImage]:
@@ -380,7 +409,6 @@ class OneBotMixin:
         else:
             endpoint = "send_group_msg"
             group_text = self._normalize_outgoing_mentions(text)
-            group_text = self._strip_group_markdown(group_text)
             if (
                 self.cfg.group_reply_at_sender
                 and event.get("user_id") is not None
@@ -420,35 +448,6 @@ class OneBotMixin:
         out = re.sub(r"\[@(?:qq=)?(\d+)\]", r"[CQ:at,qq=\1]", text, flags=re.IGNORECASE)
         out = re.sub(r"\[@all\]", "[CQ:at,qq=all]", out, flags=re.IGNORECASE)
         return out
-
-    @staticmethod
-    def _strip_group_markdown(text: str) -> str:
-        # Group replies should be plain text while preserving OneBot CQ tags.
-        raw = text.replace("\r\n", "\n")
-        cq_tags = re.findall(r"\[CQ:[^\]]+\]", raw, flags=re.IGNORECASE)
-        for i, tag in enumerate(cq_tags):
-            raw = raw.replace(tag, f"__CQ_TAG_{i}__", 1)
-
-        raw = re.sub(r"```[a-zA-Z0-9_-]*\n?", "", raw)
-        raw = raw.replace("```", "")
-        raw = re.sub(r"`([^`]*)`", r"\1", raw)
-
-        raw = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\1", raw)
-        raw = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", raw)
-
-        raw = re.sub(r"^\s{0,3}#{1,6}\s*", "", raw, flags=re.MULTILINE)
-        raw = re.sub(r"^\s{0,3}>\s?", "", raw, flags=re.MULTILINE)
-        raw = re.sub(r"^\s{0,3}(?:[-*+]\s+|\d+\.\s+)", "", raw, flags=re.MULTILINE)
-        raw = re.sub(r"^\s{0,3}---+\s*$", "", raw, flags=re.MULTILINE)
-
-        raw = re.sub(r"(\*\*|__)(.*?)\1", r"\2", raw)
-        raw = re.sub(r"(\*|_)(.*?)\1", r"\2", raw)
-        raw = re.sub(r"~~(.*?)~~", r"\1", raw)
-        raw = re.sub(r"\n{3,}", "\n\n", raw).strip()
-
-        for i, tag in enumerate(cq_tags):
-            raw = raw.replace(f"__CQ_TAG_{i}__", tag)
-        return raw
 
     async def _onebot_action(
         self, action: str, payload: dict[str, Any], timeout_sec: float | None = None
