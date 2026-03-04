@@ -71,6 +71,7 @@ uv run start
 - 内建指令：
   - `/new`：重置当前会话（桥接会调用 OpenClaw `sessions.reset`）
   - `/pair <配对码>`：OP 审批配对（私聊/群聊）
+  - `/unpair`：OP 取消当前会话配对（私聊/群聊）
   - `/op list|add|del`：OP 列表查看/增删（仅 OP 可执行；群聊也仅 OP 可执行）
   - `/help`：查看指令说明
 - 群聊未触发时也会记录该用户消息到会话上下文，等下次触发时一并带入

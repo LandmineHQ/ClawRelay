@@ -467,6 +467,8 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             return True
         if re.fullmatch(r"/op (?:list|add \d{5,20}|del \d{5,20})", normalized):
             return True
+        if normalized == "/unpair":
+            return True
         return False
 
     async def _handle_pair_command(self, event: dict[str, Any], command: str) -> None:
@@ -553,6 +555,30 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             "用法：`/op list`、`/op add <user_id>`、`/op del <user_id>`",
         )
 
+    async def _handle_unpair_command(self, event: dict[str, Any], session_key: str) -> None:
+        if not await self._ensure_op_permission(event, "/unpair"):
+            return
+        target = self._pairing_target_from_event(event)
+        if target is None:
+            await self._send_onebot_reply(event, "无法识别当前会话目标，未执行取消配对。")
+            return
+        target_type, target_id, target_key = target
+        existed = self.pairing_approved.pop(target_key, None)
+        self.pairing_pending.pop(target_key, None)
+        self.pending_context[session_key].clear()
+        self.session_prompt_bootstrapped.discard(session_key)
+        self._save_pairing_store()
+        if existed is None:
+            await self._send_onebot_reply(
+                event,
+                f"当前会话（{self._pairing_target_display(target_type, target_id)}）原本未配对，已清理待配对状态。",
+            )
+            return
+        await self._send_onebot_reply(
+            event,
+            f"已移除当前会话配对：{self._pairing_target_display(target_type, target_id)}",
+        )
+
     async def _handle_local_command(
         self, event: dict[str, Any], session_key: str, command: str
     ) -> None:
@@ -583,6 +609,10 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
 
         if re.fullmatch(r"/op (?:list|add \d{5,20}|del \d{5,20})", cmd):
             await self._handle_op_command(event, command)
+            return
+
+        if cmd in {"/unpair", "unpair"}:
+            await self._handle_unpair_command(event, session_key)
 
     async def _process_message(
         self,

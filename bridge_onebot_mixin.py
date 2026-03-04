@@ -401,6 +401,9 @@ class OneBotMixin:
             if target_uid:
                 return f"/op del {target_uid}"
 
+        if re.fullmatch(r"/?unpair", normalized):
+            return "/unpair"
+
         return None
 
     @staticmethod
@@ -409,8 +412,9 @@ class OneBotMixin:
             "可用指令：\n"
             "1) `/new`：重置当前会话上下文（开启新会话）\n"
             "2) `/pair <配对码>`：OP 审批当前待配对会话（私聊/群聊）\n"
-            "3) `/op list|add|del`：OP 列表管理（仅 OP 可执行）\n"
-            "4) `/help`：查看指令说明"
+            "3) `/unpair`：OP 移除当前会话配对（私聊/群聊）\n"
+            "4) `/op list|add|del`：OP 列表管理（仅 OP 可执行）\n"
+            "5) `/help`：查看指令说明"
         )
 
     def _build_prompt_from_pending(
