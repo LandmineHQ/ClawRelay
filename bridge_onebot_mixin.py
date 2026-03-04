@@ -320,7 +320,8 @@ class OneBotMixin:
                 + "当前待回复消息：\n"
                 + "```text\n"
                 + current_line
-                + "\n```"
+                + "\n```\n"
+                + "回复要求：仅输出纯文本，不要使用 Markdown 格式（不要使用代码块、标题、列表、加粗等）。"
             )
         return (
             "你正在 QQ 群聊中对话，请结合历史继续当前话题并直接回复用户。\n"
@@ -334,6 +335,7 @@ class OneBotMixin:
             + "\n```\n"
             + "说明：消息中的@以 OneBot CQ 码表示（例如 `[CQ:at,qq=123456]`）。"
             + "如果需要@某人，请在回复中输出对应的 CQ 码，或使用 `[@123456]`。"
+            + "回复要求：仅输出纯文本，不要使用 Markdown 格式（不要使用代码块、标题、列表、加粗等）。"
         )
 
     def _collect_recent_images(self, pending: list[PendingObservation]) -> list[MessageImage]:
@@ -378,6 +380,7 @@ class OneBotMixin:
         else:
             endpoint = "send_group_msg"
             group_text = self._normalize_outgoing_mentions(text)
+            group_text = self._strip_group_markdown(group_text)
             if (
                 self.cfg.group_reply_at_sender
                 and event.get("user_id") is not None
@@ -417,6 +420,35 @@ class OneBotMixin:
         out = re.sub(r"\[@(?:qq=)?(\d+)\]", r"[CQ:at,qq=\1]", text, flags=re.IGNORECASE)
         out = re.sub(r"\[@all\]", "[CQ:at,qq=all]", out, flags=re.IGNORECASE)
         return out
+
+    @staticmethod
+    def _strip_group_markdown(text: str) -> str:
+        # Group replies should be plain text while preserving OneBot CQ tags.
+        raw = text.replace("\r\n", "\n")
+        cq_tags = re.findall(r"\[CQ:[^\]]+\]", raw, flags=re.IGNORECASE)
+        for i, tag in enumerate(cq_tags):
+            raw = raw.replace(tag, f"__CQ_TAG_{i}__", 1)
+
+        raw = re.sub(r"```[a-zA-Z0-9_-]*\n?", "", raw)
+        raw = raw.replace("```", "")
+        raw = re.sub(r"`([^`]*)`", r"\1", raw)
+
+        raw = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\1", raw)
+        raw = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", raw)
+
+        raw = re.sub(r"^\s{0,3}#{1,6}\s*", "", raw, flags=re.MULTILINE)
+        raw = re.sub(r"^\s{0,3}>\s?", "", raw, flags=re.MULTILINE)
+        raw = re.sub(r"^\s{0,3}(?:[-*+]\s+|\d+\.\s+)", "", raw, flags=re.MULTILINE)
+        raw = re.sub(r"^\s{0,3}---+\s*$", "", raw, flags=re.MULTILINE)
+
+        raw = re.sub(r"(\*\*|__)(.*?)\1", r"\2", raw)
+        raw = re.sub(r"(\*|_)(.*?)\1", r"\2", raw)
+        raw = re.sub(r"~~(.*?)~~", r"\1", raw)
+        raw = re.sub(r"\n{3,}", "\n\n", raw).strip()
+
+        for i, tag in enumerate(cq_tags):
+            raw = raw.replace(f"__CQ_TAG_{i}__", tag)
+        return raw
 
     async def _onebot_action(
         self, action: str, payload: dict[str, Any], timeout_sec: float | None = None
