@@ -69,6 +69,7 @@ uv run start
   - `@机器人`
   - 以 `GROUP_PREFIX`（默认 `/ai`）开头
 - 内建指令：
+  - 说明：以下指令均支持带 `/` 或不带 `/`
   - `/new`：重置当前会话（桥接会调用 OpenClaw `sessions.reset`）
   - `/pair <配对码>`：OP 审批配对（私聊/群聊）
   - `/unpair`：OP 取消当前会话配对（私聊/群聊）

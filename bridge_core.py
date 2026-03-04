@@ -461,15 +461,22 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         return matched.group(0) if matched else ""
 
     @staticmethod
-    def _is_admin_command(command: str) -> bool:
+    def _normalized_command_body(command: str) -> str:
         normalized = OpenClawOneBotBridge._normalize_command_text(command)
-        if re.fullmatch(r"/pair [a-z0-9]{4,12}", normalized):
-            return True
-        if re.fullmatch(r"/op (?:list|add \d{5,20}|del \d{5,20})", normalized):
-            return True
-        if normalized == "/unpair":
-            return True
-        return False
+        if normalized.startswith("/"):
+            normalized = normalized[1:].strip()
+        return normalized
+
+    @staticmethod
+    def _command_name(command: str) -> str:
+        body = OpenClawOneBotBridge._normalized_command_body(command)
+        if not body:
+            return ""
+        return body.split(" ", 1)[0]
+
+    @staticmethod
+    def _is_admin_command(command: str) -> bool:
+        return OpenClawOneBotBridge._command_name(command) in {"pair", "op", "unpair"}
 
     async def _handle_pair_command(self, event: dict[str, Any], command: str) -> None:
         if not await self._ensure_op_permission(event, "/pair"):
@@ -579,40 +586,63 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             f"已移除当前会话配对：{self._pairing_target_display(target_type, target_id)}",
         )
 
+    async def _exec_help_command(
+        self, event: dict[str, Any], _session_key: str, _command_body: str
+    ) -> None:
+        await self._send_onebot_reply(event, self._help_text())
+
+    async def _exec_new_command(
+        self, event: dict[str, Any], session_key: str, _command_body: str
+    ) -> None:
+        if not await self._ensure_target_pairing(event, session_key):
+            return
+        # 清除桥接侧暂存上下文，并重置 OpenClaw 会话。
+        self.pending_context[session_key].clear()
+        self.session_prompt_bootstrapped.discard(session_key)
+        ok, err = await self._reset_openclaw_session(session_key)
+        if ok:
+            await self._send_onebot_reply(event, "已重置当前会话。")
+        else:
+            await self._send_onebot_reply(
+                event,
+                f"会话重置失败：{err}\n请检查 OpenClaw token/scopes（需要 operator.admin）。",
+            )
+
+    async def _exec_pair_command(
+        self, event: dict[str, Any], _session_key: str, command_body: str
+    ) -> None:
+        await self._handle_pair_command(event, command_body)
+
+    async def _exec_op_command(
+        self, event: dict[str, Any], _session_key: str, command_body: str
+    ) -> None:
+        await self._handle_op_command(event, command_body)
+
+    async def _exec_unpair_command(
+        self, event: dict[str, Any], session_key: str, _command_body: str
+    ) -> None:
+        await self._handle_unpair_command(event, session_key)
+
+    def _local_command_registry(self) -> dict[str, Any]:
+        return {
+            "help": self._exec_help_command,
+            "new": self._exec_new_command,
+            "pair": self._exec_pair_command,
+            "op": self._exec_op_command,
+            "unpair": self._exec_unpair_command,
+        }
+
     async def _handle_local_command(
         self, event: dict[str, Any], session_key: str, command: str
     ) -> None:
-        cmd = self._normalize_command_text(command)
-        if cmd in {"/help", "help"}:
-            await self._send_onebot_reply(event, self._help_text())
+        command_body = self._normalized_command_body(command)
+        if not command_body:
             return
-
-        if cmd in {"/new", "new"}:
-            if not await self._ensure_target_pairing(event, session_key):
-                return
-            # 清除桥接侧暂存上下文，并重置 OpenClaw 会话。
-            self.pending_context[session_key].clear()
-            self.session_prompt_bootstrapped.discard(session_key)
-            ok, err = await self._reset_openclaw_session(session_key)
-            if ok:
-                await self._send_onebot_reply(event, "已重置当前会话。")
-            else:
-                await self._send_onebot_reply(
-                    event,
-                    f"会话重置失败：{err}\n请检查 OpenClaw token/scopes（需要 operator.admin）。",
-                )
+        command_name = command_body.split(" ", 1)[0]
+        handler = self._local_command_registry().get(command_name)
+        if handler is None:
             return
-
-        if re.fullmatch(r"/pair [a-z0-9]{4,12}", cmd):
-            await self._handle_pair_command(event, command)
-            return
-
-        if re.fullmatch(r"/op (?:list|add \d{5,20}|del \d{5,20})", cmd):
-            await self._handle_op_command(event, command)
-            return
-
-        if cmd in {"/unpair", "unpair"}:
-            await self._handle_unpair_command(event, session_key)
+        await handler(event, session_key, command_body)
 
     async def _process_message(
         self,

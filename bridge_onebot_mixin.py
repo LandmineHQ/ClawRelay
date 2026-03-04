@@ -354,6 +354,21 @@ class OneBotMixin:
             return cq_match.group(1)
         return ""
 
+    @staticmethod
+    def _normalize_local_command_text(text: str) -> str:
+        normalized = (text or "").strip().lower()
+        normalized = normalized.replace("／", "/")
+        if normalized.startswith("\\"):
+            normalized = "/" + normalized[1:]
+        return re.sub(r"\s+", " ", normalized)
+
+    @staticmethod
+    def _build_op_command(action: str, raw_target: str) -> str | None:
+        target_uid = OneBotMixin._extract_op_target_user_id(raw_target)
+        if not target_uid:
+            return None
+        return f"op {action} {target_uid}"
+
     def _detect_local_command(self, text: str, images: list[MessageImage]) -> str | None:
         if images:
             return None
@@ -370,46 +385,38 @@ class OneBotMixin:
                 break
             stripped = next_value
         stripped, _ = OneBotMixin._strip_leading_plain_mention(stripped)
-        normalized = stripped.strip().lower()
-        normalized = normalized.replace("／", "/")
-        if normalized.startswith("\\"):
-            normalized = "/" + normalized[1:]
-        normalized = re.sub(r"\s+", " ", normalized)
-
-        if normalized in {"/new", "new"}:
-            return "/new"
-        if normalized in {"/help", "help"}:
-            return "/help"
+        normalized = self._normalize_local_command_text(stripped)
 
         code_len = max(4, min(12, int(self.cfg.pairing_code_len)))
-        pair_matched = re.fullmatch(rf"/?(?:pair|pairing)\s+([a-z0-9]{{{code_len}}})", normalized)
-        if pair_matched:
-            return f"/pair {pair_matched.group(1).upper()}"
-
-        if re.fullmatch(r"/?op(?:\s+(?:list|ls))?", normalized):
-            return "/op list"
-
-        op_add_matched = re.fullmatch(r"/?op\s+(?:add|\+)\s+(.+)", normalized)
-        if op_add_matched:
-            target_uid = OneBotMixin._extract_op_target_user_id(op_add_matched.group(1))
-            if target_uid:
-                return f"/op add {target_uid}"
-
-        op_del_matched = re.fullmatch(r"/?op\s+(?:del|remove|rm|-)\s+(.+)", normalized)
-        if op_del_matched:
-            target_uid = OneBotMixin._extract_op_target_user_id(op_del_matched.group(1))
-            if target_uid:
-                return f"/op del {target_uid}"
-
-        if re.fullmatch(r"/?unpair", normalized):
-            return "/unpair"
+        command_specs: list[tuple[str, Any]] = [
+            (r"/?new", lambda _m: "new"),
+            (r"/?help", lambda _m: "help"),
+            (
+                rf"/?(?:pair|pairing)\s+([a-z0-9]{{{code_len}}})",
+                lambda m: f"pair {m.group(1).upper()}",
+            ),
+            (r"/?unpair", lambda _m: "unpair"),
+            (r"/?op(?:\s+(?:list|ls))?", lambda _m: "op list"),
+            (r"/?op\s+(?:add|\+)\s+(.+)", lambda m: OneBotMixin._build_op_command("add", m.group(1))),
+            (
+                r"/?op\s+(?:del|remove|rm|-)\s+(.+)",
+                lambda m: OneBotMixin._build_op_command("del", m.group(1)),
+            ),
+        ]
+        for pattern, builder in command_specs:
+            matched = re.fullmatch(pattern, normalized)
+            if not matched:
+                continue
+            built = builder(matched)
+            if built:
+                return str(built)
 
         return None
 
     @staticmethod
     def _help_text() -> str:
         return (
-            "可用指令：\n"
+            "可用指令（以下 `/` 前缀均可省略）：\n"
             "1) `/new`：重置当前会话上下文（开启新会话）\n"
             "2) `/pair <配对码>`：OP 审批当前待配对会话（私聊/群聊）\n"
             "3) `/unpair`：OP 移除当前会话配对（私聊/群聊）\n"
