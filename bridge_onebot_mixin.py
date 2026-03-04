@@ -345,7 +345,7 @@ class OneBotMixin:
             "规则：\n"
             "1) user_name 可能包含数字（例如“我是1354987”），这不是 QQ 号。\n"
             "2) 只能使用 user_id 作为 QQ 号；如需@，仅可输出 `[CQ:at,qq=<user_id>]`。\n"
-            "3) 默认不@，除非明确需要点名。\n"
+            "3) 默认@发送者，除非被要求不@发送者。\n"
             f"4) 当前待回复消息发送者 user_id: {current_sender_id}\n"
             "5) 默认使用简洁纯文本回复；仅当用户明确要求 Markdown 时，才使用 Markdown。"
         )
