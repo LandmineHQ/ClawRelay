@@ -1,4 +1,5 @@
 .env
+.bridge_private_pairing_users.json
 
 # Python-generated files
 __pycache__/

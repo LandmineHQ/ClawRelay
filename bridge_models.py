@@ -22,3 +22,9 @@ class PendingObservation:
     ts: float
     sender_name: str = ""
     sender_id: str = ""
+
+
+@dataclass
+class PrivatePairingRequest:
+    code: str
+    expires_at: float

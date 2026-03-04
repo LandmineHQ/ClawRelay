@@ -43,6 +43,10 @@ uv run start
 - `OPENCLAW_SCOPES`：默认 `operator.read,operator.write`
 - `OPENCLAW_TIMEOUT_SEC`：OpenClaw 单次问答超时，默认 `180`
 - `OPENCLAW_SESSION_PREFIX`：会话前缀，默认 `qq`
+- `PRIVATE_REQUIRE_PAIRING`：私聊是否要求配对码后才能调用 OpenClaw，默认 `true`
+- `PRIVATE_PAIRING_CODE_LEN`：私聊配对码长度（4~12），默认 `8`
+- `PRIVATE_PAIRING_TTL_SEC`：私聊配对码有效期（秒），默认 `3600`
+- `PRIVATE_PAIRING_STORE_PATH`：私聊配对状态持久化文件路径（以 `user_id` 作为 key），默认 `./.bridge_private_pairing_users.json`
 - `GROUP_REQUIRE_AT`：群聊是否必须 @ 机器人才触发，默认 `true`
 - `GROUP_PREFIX`：群聊命令前缀，默认 `/ai`（可与@并存）
 - `GROUP_REPLY_AT_SENDER`：群聊回复时是否 @ 发送者，默认 `true`
@@ -54,7 +58,10 @@ uv run start
 
 ## 4. 触发规则
 
-- 私聊：直接对话
+- 私聊：
+  - 若 `PRIVATE_REQUIRE_PAIRING=true`，首次私聊会收到配对码提示，需先回复配对码完成绑定，之后才会转发到 OpenClaw
+  - 已配对 `user_id` 会写入 `PRIVATE_PAIRING_STORE_PATH`，bridge 重启后仍生效
+  - 若 `PRIVATE_REQUIRE_PAIRING=false`，直接对话
 - 群聊：满足以下任一条件会触发
   - `@机器人`
   - 以 `GROUP_PREFIX`（默认 `/ai`）开头

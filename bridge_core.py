@@ -1,13 +1,17 @@
 import asyncio
 import json
 import logging
+import os
+import re
+import secrets
+import time
 from collections import defaultdict, deque
 from typing import Any
 
 import aiohttp
 
 from bridge_config import Config
-from bridge_models import MessageImage, PendingObservation
+from bridge_models import MessageImage, PendingObservation, PrivatePairingRequest
 from bridge_onebot_mixin import OneBotMixin
 from bridge_openclaw_mixin import OpenClawGatewayMixin
 
@@ -31,6 +35,8 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self.gateway_relay_runs: set[str] = set()
         self.gateway_run_preferred_targets: dict[str, dict[str, Any]] = {}
         self.session_onebot_routes: dict[str, dict[str, Any]] = {}
+        self.private_pairing_verified_users: set[str] = set()
+        self.private_pairing_pending: dict[str, PrivatePairingRequest] = {}
         self.pending_context: dict[str, deque[PendingObservation]] = defaultdict(
             lambda: deque(maxlen=max(2, self.cfg.context_observation_limit))
         )
@@ -39,6 +45,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self.image_support_cache_until: float = 0.0
         self.image_support_cache_value: bool | None = None
         self.image_support_model_desc: str = "unknown"
+        self._load_private_pairing_store()
 
     def _discard_bg_task(self, task: asyncio.Task[Any]) -> None:
         self.bg_tasks.discard(task)
@@ -65,6 +72,148 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         if event.get("group_id") is not None:
             route["group_id"] = event.get("group_id")
         self.session_onebot_routes[key] = route
+
+    @staticmethod
+    def _pairing_charset() -> str:
+        # Exclude ambiguous characters: 0/O and 1/I.
+        return "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+
+    def _private_pairing_store_path(self) -> str:
+        path = self.cfg.private_pairing_store_path.strip()
+        return path or "./.bridge_private_pairing_users.json"
+
+    def _load_private_pairing_store(self) -> None:
+        path = self._private_pairing_store_path()
+        try:
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                parsed = json.load(f)
+            users: set[str] = set()
+            if isinstance(parsed, dict):
+                users_value = parsed.get("users")
+                if isinstance(users_value, dict):
+                    users = {str(uid).strip() for uid in users_value.keys() if str(uid).strip()}
+                else:
+                    users = {
+                        str(uid).strip()
+                        for uid in parsed.keys()
+                        if str(uid).strip() and str(uid) != "version"
+                    }
+            self.private_pairing_verified_users = users
+            if users:
+                logging.info("Loaded private pairing users: %s from %s", len(users), path)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to load private pairing store %s: %s", path, exc)
+
+    def _save_private_pairing_store(self) -> None:
+        path = self._private_pairing_store_path()
+        try:
+            folder = os.path.dirname(path)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+
+            users_payload = {uid: True for uid in sorted(self.private_pairing_verified_users)}
+            payload: dict[str, Any] = {
+                "version": 1,
+                "users": users_payload,
+                "updatedAt": int(time.time()),
+            }
+
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to save private pairing store %s: %s", path, exc)
+
+    def _private_pairing_code_len(self) -> int:
+        return max(4, min(12, int(self.cfg.private_pairing_code_len)))
+
+    def _private_pairing_ttl_sec(self) -> int:
+        return max(60, int(self.cfg.private_pairing_ttl_sec))
+
+    @staticmethod
+    def _private_user_id(event: dict[str, Any]) -> str:
+        return str(event.get("user_id", "")).strip()
+
+    def _extract_pairing_candidate(self, text: str) -> str:
+        code_len = self._private_pairing_code_len()
+        normalized = re.sub(r"[^A-Za-z0-9]", "", (text or "").upper())
+        if len(normalized) == code_len:
+            return normalized
+        token_pattern = re.compile(rf"[A-Za-z0-9]{{{code_len}}}")
+        matched = token_pattern.search((text or "").upper())
+        return matched.group(0) if matched else ""
+
+    def _issue_private_pairing_request(self, user_id: str) -> PrivatePairingRequest:
+        charset = self._pairing_charset()
+        code_len = self._private_pairing_code_len()
+        code = "".join(secrets.choice(charset) for _ in range(code_len))
+        req = PrivatePairingRequest(code=code, expires_at=time.time() + self._private_pairing_ttl_sec())
+        self.private_pairing_pending[user_id] = req
+        return req
+
+    async def _ensure_private_pairing(
+        self, event: dict[str, Any], session_key: str, text: str
+    ) -> bool:
+        if not self.cfg.private_require_pairing:
+            return True
+        if event.get("message_type") != "private":
+            return True
+
+        user_id = self._private_user_id(event)
+        if not user_id:
+            return False
+        if user_id in self.private_pairing_verified_users:
+            return True
+
+        now = time.time()
+        pending = self.private_pairing_pending.get(user_id)
+        if pending is not None and pending.expires_at <= now:
+            self.private_pairing_pending.pop(user_id, None)
+            pending = None
+
+        candidate = self._extract_pairing_candidate(text)
+        if pending is not None:
+            if candidate and candidate == pending.code:
+                self.private_pairing_verified_users.add(user_id)
+                self._save_private_pairing_store()
+                self.private_pairing_pending.pop(user_id, None)
+                self.session_prompt_bootstrapped.discard(session_key)
+                await self._send_onebot_reply(
+                    event,
+                    "配对成功，当前私聊会话已绑定 OpenClaw。请继续发送你的问题。",
+                )
+                return False
+            if candidate:
+                await self._send_onebot_reply(
+                    event,
+                    (
+                        f"配对码不正确。请回复正确的配对码：{pending.code}\n"
+                        f"配对码有效期至 {time.strftime('%H:%M:%S', time.localtime(pending.expires_at))}。"
+                    ),
+                )
+                return False
+            await self._send_onebot_reply(
+                event,
+                (
+                    f"当前私聊尚未配对。请回复配对码：{pending.code}\n"
+                    f"配对码有效期至 {time.strftime('%H:%M:%S', time.localtime(pending.expires_at))}。"
+                ),
+            )
+            return False
+
+        req = self._issue_private_pairing_request(user_id)
+        await self._send_onebot_reply(
+            event,
+            (
+                "当前私聊需要先进行配对认证。\n"
+                f"请回复以下配对码完成绑定：{req.code}\n"
+                f"配对码有效期至 {time.strftime('%H:%M:%S', time.localtime(req.expires_at))}。"
+            ),
+        )
+        return False
 
     @staticmethod
     def _merge_hint_reply(hint: str, reply: str) -> str:
@@ -179,6 +328,8 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             return
 
         if cmd == "/new":
+            if not await self._ensure_private_pairing(event, session_key, command):
+                return
             # 清除桥接侧暂存上下文，并重置 OpenClaw 会话。
             self.pending_context[session_key].clear()
             self.session_prompt_bootstrapped.discard(session_key)
@@ -281,6 +432,8 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         # Private chat: send user content directly to OpenClaw without local prompt building.
         if event.get("message_type") == "private":
             if not should_reply:
+                return
+            if not await self._ensure_private_pairing(event, session_key, latest_text):
                 return
             task = asyncio.create_task(
                 self._process_message(
