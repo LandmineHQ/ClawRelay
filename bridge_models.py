@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -12,6 +12,8 @@ class ParsedMessage:
     text: str
     mentioned: bool
     images: list[MessageImage]
+    reply_ids: list[str] = field(default_factory=list)
+    forward_ids: list[str] = field(default_factory=list)
 
 
 @dataclass

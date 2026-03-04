@@ -73,6 +73,18 @@ class OneBotMixin:
         return merged
 
     @staticmethod
+    def _merge_str_list(primary: list[str], secondary: list[str]) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for value in [*primary, *secondary]:
+            key = str(value).strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(key)
+        return merged
+
+    @staticmethod
     def _image_hash_hint(img: MessageImage) -> str:
         if img.file.strip():
             return os.path.basename(img.file.strip())
@@ -91,6 +103,8 @@ class OneBotMixin:
     ) -> ParsedMessage:
         mentioned = False
         images: list[MessageImage] = []
+        reply_ids: list[str] = []
+        forward_ids: list[str] = []
 
         if isinstance(payload, list):
             text_parts: list[str] = []
@@ -114,8 +128,28 @@ class OneBotMixin:
                     img = MessageImage(url=url, file=file)
                     images.append(img)
                     text_parts.append(self._image_tag(img))
+                elif seg_type in {"reply", "quote"}:
+                    ref_id = str(data.get("id") or data.get("message_id") or "").strip()
+                    if ref_id:
+                        reply_ids.append(ref_id)
+                elif seg_type in {"forward", "longmsg"}:
+                    fwd_id = str(
+                        data.get("id")
+                        or data.get("message_id")
+                        or data.get("resid")
+                        or data.get("res_id")
+                        or ""
+                    ).strip()
+                    if fwd_id:
+                        forward_ids.append(fwd_id)
             text = re.sub(r"\s+", " ", "".join(text_parts)).strip()
-            return ParsedMessage(text=text, mentioned=mentioned, images=images)
+            return ParsedMessage(
+                text=text,
+                mentioned=mentioned,
+                images=images,
+                reply_ids=reply_ids,
+                forward_ids=forward_ids,
+            )
 
         if isinstance(payload, str):
             text_parts: list[str] = []
@@ -140,6 +174,23 @@ class OneBotMixin:
                     )
                     images.append(img)
                     text_parts.append(self._image_tag(img))
+                    continue
+                if cq_type in {"reply", "quote"}:
+                    ref_id = str(params.get("id", "")).strip()
+                    if ref_id:
+                        reply_ids.append(ref_id)
+                    continue
+                if cq_type in {"forward", "longmsg"}:
+                    fwd_id = str(
+                        params.get("id")
+                        or params.get("message_id")
+                        or params.get("resid")
+                        or params.get("res_id")
+                        or ""
+                    ).strip()
+                    if fwd_id:
+                        forward_ids.append(fwd_id)
+                    continue
             text_parts.append(payload[last:])
             merged = "".join(text_parts)
 
@@ -160,20 +211,30 @@ class OneBotMixin:
             )
 
             text = re.sub(r"\s+", " ", merged).strip()
-            return ParsedMessage(text=text, mentioned=mentioned, images=images)
+            return ParsedMessage(
+                text=text,
+                mentioned=mentioned,
+                images=images,
+                reply_ids=reply_ids,
+                forward_ids=forward_ids,
+            )
 
-        return ParsedMessage(text="", mentioned=False, images=[])
+        return ParsedMessage(text="", mentioned=False, images=[], reply_ids=[], forward_ids=[])
 
     def _extract_message(self, event: dict[str, Any]) -> ParsedMessage:
         self_qq = self._get_self_qq(event)
         parsed_main = self._extract_message_from_payload(event.get("message"), self_qq)
         parsed_raw = self._extract_message_from_payload(event.get("raw_message"), self_qq)
         merged_images = self._merge_images(parsed_main.images, parsed_raw.images)
+        merged_reply_ids = self._merge_str_list(parsed_main.reply_ids, parsed_raw.reply_ids)
+        merged_forward_ids = self._merge_str_list(parsed_main.forward_ids, parsed_raw.forward_ids)
         text = parsed_main.text or parsed_raw.text
         return ParsedMessage(
             text=text,
             mentioned=parsed_main.mentioned or parsed_raw.mentioned,
             images=merged_images,
+            reply_ids=merged_reply_ids,
+            forward_ids=merged_forward_ids,
         )
 
     @staticmethod
@@ -495,32 +556,180 @@ class OneBotMixin:
         result = data.get("data")
         return result if isinstance(result, dict) else {}
 
+    @staticmethod
+    def _compact_text(text: str) -> str:
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _truncate_text(text: str, max_len: int) -> str:
+        raw = text.strip()
+        if len(raw) <= max_len:
+            return raw
+        return raw[: max(1, max_len - 1)].rstrip() + "…"
+
+    def _sender_name_id_from_message_record(self, record: dict[str, Any]) -> tuple[str, str]:
+        sender_raw = record.get("sender")
+        sender = sender_raw if isinstance(sender_raw, dict) else {}
+        sender_id = str(
+            record.get("user_id")
+            or sender.get("user_id")
+            or sender.get("qq")
+            or sender.get("id")
+            or "unknown"
+        ).strip()
+        sender_name = str(sender.get("card") or sender.get("nickname") or sender_id).strip() or sender_id
+        return sender_name, sender_id or "unknown"
+
+    def _parse_message_record_payload(self, record: dict[str, Any], self_qq: str) -> ParsedMessage:
+        parsed_main = self._extract_message_from_payload(record.get("message"), self_qq)
+        parsed_raw = self._extract_message_from_payload(record.get("raw_message"), self_qq)
+        return ParsedMessage(
+            text=parsed_main.text or parsed_raw.text,
+            mentioned=parsed_main.mentioned or parsed_raw.mentioned,
+            images=self._merge_images(parsed_main.images, parsed_raw.images),
+            reply_ids=self._merge_str_list(parsed_main.reply_ids, parsed_raw.reply_ids),
+            forward_ids=self._merge_str_list(parsed_main.forward_ids, parsed_raw.forward_ids),
+        )
+
+    def _build_reply_context_block(self, record: dict[str, Any], self_qq: str) -> tuple[str, list[MessageImage]]:
+        sender_name, sender_id = self._sender_name_id_from_message_record(record)
+        parsed = self._parse_message_record_payload(record, self_qq)
+        content = self._truncate_text(self._compact_text(parsed.text or "（无文本）"), 300)
+        block = (
+            "[引用消息]\n"
+            f"- user_name: {sender_name}\n"
+            f"- user_id: {sender_id}\n"
+            f"- content: {content}"
+        )
+        return block, parsed.images
+
+    def _build_forward_context_block(
+        self, forward_id: str, payload: dict[str, Any], self_qq: str
+    ) -> tuple[str, list[MessageImage]]:
+        nodes_raw = payload.get("messages")
+        nodes = nodes_raw if isinstance(nodes_raw, list) else []
+        out_images: list[MessageImage] = []
+        lines: list[str] = [f"[合并转发消息 id={forward_id}]"]
+        max_nodes = 6
+        for idx, raw_node in enumerate(nodes[:max_nodes], start=1):
+            if not isinstance(raw_node, dict):
+                continue
+            sender_raw = raw_node.get("sender")
+            sender = sender_raw if isinstance(sender_raw, dict) else {}
+            node_name = str(sender.get("name") or sender.get("nickname") or sender.get("card") or "unknown")
+            node_id = str(
+                sender.get("user_id")
+                or sender.get("uin")
+                or sender.get("qq")
+                or sender.get("id")
+                or "unknown"
+            ).strip()
+            content_payload = raw_node.get("content")
+            if content_payload is None:
+                content_payload = raw_node.get("message")
+            parsed = self._extract_message_from_payload(content_payload, self_qq)
+            out_images = self._merge_images(out_images, parsed.images)
+            node_content = self._truncate_text(self._compact_text(parsed.text or "（无文本）"), 240)
+            lines.append(
+                f"- node_{idx}:\n"
+                f"  user_name: {node_name}\n"
+                f"  user_id: {node_id or 'unknown'}\n"
+                f"  content: {node_content}"
+            )
+        remaining = len(nodes) - min(len(nodes), max_nodes)
+        if remaining > 0:
+            lines.append(f"- 其余 {remaining} 条转发节点已省略")
+        return "\n".join(lines), out_images
+
+    async def _onebot_get_forward_msg(self, forward_id: str) -> dict[str, Any] | None:
+        candidates = [
+            {"message_id": forward_id},
+            {"id": forward_id},
+            {"resid": forward_id},
+            {"res_id": forward_id},
+        ]
+        best: dict[str, Any] | None = None
+        for payload in candidates:
+            data = await self._onebot_action("get_forward_msg", payload, timeout_sec=10)
+            if data is None:
+                continue
+            best = data
+            messages = data.get("messages")
+            if isinstance(messages, list) and messages:
+                return data
+        return best
+
     async def _augment_parsed_message(self, event: dict[str, Any], parsed: ParsedMessage) -> ParsedMessage:
-        # 当 message 只呈现为 “[图片]xxx.png” 时，补查 get_msg 还原标准消息段。
         if self.session is None:
             return parsed
-        message_id = event.get("message_id")
-        if message_id is None:
-            return parsed
-
-        needs_augment = (not parsed.images) or any((not img.url and img.file) for img in parsed.images)
-        if not needs_augment:
-            return parsed
-
-        extra = await self._onebot_action("get_msg", {"message_id": message_id})
-        if not extra:
-            return parsed
-
         self_qq = self._get_self_qq(event)
-        parsed_from_msg = self._extract_message_from_payload(extra.get("message"), self_qq)
-        parsed_from_raw = self._extract_message_from_payload(extra.get("raw_message"), self_qq)
-        images = self._merge_images(parsed.images, parsed_from_msg.images)
-        images = self._merge_images(images, parsed_from_raw.images)
-        text = parsed.text or parsed_from_msg.text or parsed_from_raw.text
+        text = parsed.text
+        images = list(parsed.images)
+        mentioned = parsed.mentioned
+        reply_ids = list(parsed.reply_ids)
+        forward_ids = list(parsed.forward_ids)
+        context_blocks: list[str] = []
+
+        # 当 message 只呈现为 “[图片]xxx.png” 时，补查 get_msg 还原标准消息段。
+        message_id = event.get("message_id")
+        needs_get_msg = (
+            message_id is not None
+            and (
+                (not parsed.images)
+                or any((not img.url and img.file) for img in parsed.images)
+            )
+        )
+        if needs_get_msg:
+            extra = await self._onebot_action("get_msg", {"message_id": message_id})
+            if extra:
+                parsed_extra = self._parse_message_record_payload(extra, self_qq)
+                images = self._merge_images(images, parsed_extra.images)
+                if not text:
+                    text = parsed_extra.text
+                mentioned = mentioned or parsed_extra.mentioned
+                reply_ids = self._merge_str_list(reply_ids, parsed_extra.reply_ids)
+                forward_ids = self._merge_str_list(forward_ids, parsed_extra.forward_ids)
+
+        # 兼容部分实现把“被引用消息”直接放在事件字段 reply 里。
+        event_reply_raw = event.get("reply")
+        event_reply = event_reply_raw if isinstance(event_reply_raw, dict) else None
+        if event_reply is not None:
+            reply_block, reply_images = self._build_reply_context_block(event_reply, self_qq)
+            context_blocks.append(reply_block)
+            images = self._merge_images(images, reply_images)
+            event_reply_id = str(
+                event_reply.get("message_id") or event_reply.get("id") or event_reply.get("msg_id") or ""
+            ).strip()
+            if event_reply_id:
+                reply_ids = [rid for rid in reply_ids if rid != event_reply_id]
+
+        for reply_id in reply_ids:
+            extra = await self._onebot_action("get_msg", {"message_id": reply_id}, timeout_sec=10)
+            if not extra:
+                continue
+            reply_block, reply_images = self._build_reply_context_block(extra, self_qq)
+            context_blocks.append(reply_block)
+            images = self._merge_images(images, reply_images)
+
+        for forward_id in forward_ids:
+            payload = await self._onebot_get_forward_msg(forward_id)
+            if not payload:
+                continue
+            forward_block, forward_images = self._build_forward_context_block(forward_id, payload, self_qq)
+            context_blocks.append(forward_block)
+            images = self._merge_images(images, forward_images)
+
+        merged_text = self._compact_text(text)
+        if context_blocks:
+            context_text = "\n\n".join(context_blocks)
+            merged_text = f"{merged_text}\n\n{context_text}".strip() if merged_text else context_text
+
         return ParsedMessage(
-            text=text,
-            mentioned=parsed.mentioned or parsed_from_msg.mentioned or parsed_from_raw.mentioned,
+            text=merged_text,
+            mentioned=mentioned,
             images=images,
+            reply_ids=reply_ids,
+            forward_ids=forward_ids,
         )
 
     async def _resolve_image_with_get_image(self, file_id: str) -> MessageImage | None:
