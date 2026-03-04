@@ -300,9 +300,16 @@ class OneBotMixin:
                 break
             stripped = next_value
         stripped, _ = OneBotMixin._strip_leading_plain_mention(stripped)
-        stripped = stripped.strip().lower()
-        if stripped in {"/new", "/help"}:
-            return stripped
+        normalized = stripped.strip().lower()
+        normalized = normalized.replace("／", "/")
+        if normalized.startswith("\\"):
+            normalized = "/" + normalized[1:]
+        normalized = re.sub(r"\s+", " ", normalized)
+
+        if normalized in {"/new", "new"}:
+            return "/new"
+        if normalized in {"/help", "help"}:
+            return "/help"
         return None
 
     @staticmethod
