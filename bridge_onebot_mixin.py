@@ -419,7 +419,7 @@ class OneBotMixin:
             if (
                 self.cfg.group_reply_at_sender
                 and event.get("user_id") is not None
-                and not self._contains_cq_at(group_text)
+                and not self._contains_cq_at_user(group_text, str(event["user_id"]))
             ):
                 group_text = f"[CQ:at,qq={event['user_id']}] {group_text}"
             payload = {"group_id": event.get("group_id"), "message": group_text, "auto_escape": False}
@@ -448,6 +448,14 @@ class OneBotMixin:
     @staticmethod
     def _contains_cq_at(text: str) -> bool:
         return bool(re.search(r"\[CQ:at,qq=[^\]]+\]", text, flags=re.IGNORECASE))
+
+    @staticmethod
+    def _contains_cq_at_user(text: str, user_id: str) -> bool:
+        qq = user_id.strip()
+        if not qq:
+            return False
+        pattern = rf"\[CQ:at,qq={re.escape(qq)}\]"
+        return bool(re.search(pattern, text, flags=re.IGNORECASE))
 
     @staticmethod
     def _normalize_outgoing_mentions(text: str) -> str:
