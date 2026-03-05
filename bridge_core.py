@@ -72,6 +72,8 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self.gateway_relay_runs: set[str] = set()
         self.gateway_run_preferred_targets: dict[str, dict[str, Any]] = {}
         self.gateway_run_processing_markers: dict[str, dict[str, Any]] = {}
+        self.gateway_run_wait_notice_tasks: dict[str, asyncio.Task[Any]] = {}
+        self.gateway_run_wait_notice_stops: dict[str, asyncio.Event] = {}
         self.cleared_processing_markers: deque[str] = deque(maxlen=4000)
         self.cleared_processing_marker_set: set[str] = set()
         self.session_onebot_routes: dict[str, dict[str, Any]] = {}
@@ -95,6 +97,64 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
 
     def _discard_bg_task(self, task: asyncio.Task[Any]) -> None:
         self.bg_tasks.discard(task)
+
+    async def _private_wait_notice_loop(
+        self,
+        run_id: str,
+        route_event: dict[str, Any],
+        stop_event: asyncio.Event,
+    ) -> None:
+        delays = [3, 4, 5, 6, 7, 8, 9, 10]
+        idx = 0
+        while True:
+            wait_sec = delays[idx] if idx < len(delays) else 10
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=float(wait_sec))
+                return
+            except asyncio.TimeoutError:
+                pass
+            if stop_event.is_set():
+                return
+            try:
+                text = "我还在处理，请耐心等待。"
+                log_io(
+                    source="bridge",
+                    direction="bridge -> satori",
+                    content="发送处理中提示",
+                    received=None,
+                    sent={
+                        "run_id": run_id,
+                        "route": self._route_log_brief(route_event),
+                        "message": text,
+                        "wait_sec": wait_sec,
+                    },
+                )
+                await self._send_onebot_reply(route_event, text)
+            except Exception:  # noqa: BLE001
+                logging.exception("Failed to send private waiting notice: run_id=%s", run_id)
+            idx += 1
+
+    def _start_private_wait_notice(self, run_id: str, route_event: dict[str, Any]) -> None:
+        if route_event.get("message_type") != "private":
+            return
+        self._stop_wait_notice(run_id)
+        stop_event = asyncio.Event()
+        self.gateway_run_wait_notice_stops[run_id] = stop_event
+        task = asyncio.create_task(
+            self._private_wait_notice_loop(run_id, dict(route_event), stop_event),
+            name=f"private-wait-notice:{run_id}",
+        )
+        self.gateway_run_wait_notice_tasks[run_id] = task
+        self.bg_tasks.add(task)
+        task.add_done_callback(self._discard_bg_task)
+
+    def _stop_wait_notice(self, run_id: str) -> None:
+        stopper = self.gateway_run_wait_notice_stops.pop(run_id, None)
+        if stopper is not None:
+            stopper.set()
+        task = self.gateway_run_wait_notice_tasks.pop(run_id, None)
+        if task is not None and not task.done():
+            task.cancel()
 
     @staticmethod
     def _normalize_openclaw_session_key(session_key: str) -> str:
@@ -533,6 +593,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         finally:
             self.gateway_relay_runs.discard(run_id)
             self.gateway_run_preferred_targets.pop(run_id, None)
+            self._stop_wait_notice(run_id)
             marker = self.gateway_run_processing_markers.pop(run_id, None)
             await self._clear_processing_emoji(marker)
 
@@ -773,6 +834,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 "reply_hint": "",
                 "ws_url": ws_url,
             }
+            self._start_private_wait_notice(run_id, event)
             if processing_marker is not None:
                 self.gateway_run_processing_markers[run_id] = processing_marker
                 processing_marker = None
@@ -900,6 +962,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                     "reply_hint": reply_hint,
                     "ws_url": ws_url,
                 }
+                self._start_private_wait_notice(run_id, event)
                 if processing_marker is not None:
                     self.gateway_run_processing_markers[run_id] = processing_marker
                     processing_marker = None
@@ -992,6 +1055,8 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         task.add_done_callback(self._discard_bg_task)
 
     async def _shutdown_runtime(self) -> None:
+        for run_id in list(self.gateway_run_wait_notice_tasks.keys()):
+            self._stop_wait_notice(run_id)
         pending_tasks = [task for task in self.bg_tasks if not task.done()]
         for task in pending_tasks:
             task.cancel()
