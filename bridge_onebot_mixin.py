@@ -518,7 +518,9 @@ class OneBotMixin:
             "3) 默认@发送者，除非被要求不@发送者。\n"
             f"4) 当前待回复消息发送者 user_id: {current_sender_id}\n"
             f"5) 当前机器人 user_id: {bot_id}；当 `<at id=\"{bot_id}\"/>` 出现时，表示在@你。\n"
-            "6) 默认使用简洁纯文本回复；仅当用户明确要求 Markdown 时，才使用 Markdown。"
+            "6) 回复内容使用 Satori message content 格式；可使用 `<at/>`、`<quote/>`、`<img/>` 等元素与文本混排。\n"
+            "7) 需要引用时，可在回复开头使用 `<quote id=\"<message_id>\"/>`；`message_id` 必须来自上下文已有 id（如 message_id/reply_ids/forward_ids），禁止编造。\n"
+            "8) 默认保持简洁；仅当用户明确要求 Markdown 时，才使用 Markdown。"
         )
         if not include_guidance:
             return (
