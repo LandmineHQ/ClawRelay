@@ -197,7 +197,6 @@ class OneBotMixin:
                     ).strip().lower()
                     mention_id = _read("id", "qq", "user_id", "userId").strip()
                     if at_type == "all":
-                        mentioned = True
                         text_parts.append(self._mention_tag("", mention_type="all"))
                         continue
                     if self_qq and mention_id == self_qq:
