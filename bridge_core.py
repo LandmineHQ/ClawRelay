@@ -610,17 +610,36 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
     ) -> None:
         if not await self._ensure_target_pairing(event, session_key):
             return
-        # 清除桥接侧暂存上下文，并重置 OpenClaw 会话。
+        # 清除桥接侧暂存上下文，并向 OpenClaw 执行 /new。
         self.pending_context[session_key].clear()
         self.session_prompt_bootstrapped.discard(session_key)
-        ok, err = await self._reset_openclaw_session(session_key)
-        if ok:
-            await self._send_onebot_reply(event, "已重置当前会话。")
-        else:
-            await self._send_onebot_reply(
-                event,
-                f"会话重置失败：{err}\n请检查 OpenClaw token/scopes（需要 operator.admin）。",
+        try:
+            ws_url, run_id, instant_text = await self._submit_openclaw(
+                session_key,
+                "/new",
+                [],
             )
+            if instant_text:
+                await self._send_onebot_reply(event, instant_text)
+                return
+            if not run_id:
+                logging.warning(
+                    "OpenClaw /new ack missing runId/text: key=%s via=%s",
+                    session_key,
+                    ws_url,
+                )
+                await self._send_onebot_reply(event, "已发送 /new，等待 OpenClaw 响应。")
+                return
+
+            self.gateway_run_preferred_targets[run_id] = {
+                "event": dict(event),
+                "session_key": session_key,
+                "reply_hint": "",
+                "ws_url": ws_url,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("OpenClaw /new failed: %s", exc)
+            await self._send_onebot_reply(event, self._openclaw_error_reply(exc))
 
     async def _exec_pair_command(
         self, event: dict[str, Any], _session_key: str, command_body: str
