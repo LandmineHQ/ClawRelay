@@ -87,6 +87,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self.image_support_cache_value: bool | None = None
         self.image_support_model_desc: str = "unknown"
         self.satori_default_route: dict[str, str] = {}
+        self.satori_last_sn: int = 0
         self._load_ops_store()
         self._load_pairing_store()
 
@@ -877,6 +878,11 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         # Private chat: send user content directly to OpenClaw without local prompt building.
         if event.get("message_type") == "private":
             if not should_reply:
+                logging.info(
+                    "Satori private message ignored by trigger rules: key=%s text=%s",
+                    session_key,
+                    normalized_text[:120],
+                )
                 return
             if not await self._ensure_target_pairing(event, session_key):
                 return
@@ -894,6 +900,12 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
 
         self._record_observation(event, session_key, normalized_text, parsed.images)
         if not should_reply:
+            logging.info(
+                "Satori group message observed only (not triggering reply): key=%s text=%s mentioned=%s",
+                session_key,
+                normalized_text[:120],
+                parsed.mentioned,
+            )
             return
         if not await self._ensure_target_pairing(event, session_key):
             return
@@ -932,6 +944,18 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             await self._close_shared_gateway()
         except Exception as exc:  # noqa: BLE001
             logging.warning("Shutdown close gateway failed: %s", exc)
+
+    async def _satori_ping_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        try:
+            while not ws.closed:
+                await asyncio.sleep(10)
+                if ws.closed:
+                    break
+                await ws.send_str(json.dumps({"op": 1}, ensure_ascii=False))
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Satori ping loop stopped: %s", exc)
 
     @staticmethod
     def _satori_parse_tag_attrs(attr_text: str) -> dict[str, str]:
@@ -1035,25 +1059,33 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             return None
         message_raw = payload.get("message")
         message = message_raw if isinstance(message_raw, dict) else {}
-        channel_raw = payload.get("channel")
+        channel_raw = payload.get("channel") or message.get("channel")
         channel = channel_raw if isinstance(channel_raw, dict) else {}
-        user_raw = payload.get("user")
+        user_raw = payload.get("user") or message.get("user")
         user = user_raw if isinstance(user_raw, dict) else {}
-        member_raw = payload.get("member")
+        member_raw = payload.get("member") or message.get("member")
         member = member_raw if isinstance(member_raw, dict) else {}
-        guild_raw = payload.get("guild")
+        guild_raw = payload.get("guild") or message.get("guild")
         guild = guild_raw if isinstance(guild_raw, dict) else {}
         login_raw = payload.get("login")
         login = login_raw if isinstance(login_raw, dict) else {}
         login_user_raw = login.get("user")
         login_user = login_user_raw if isinstance(login_user_raw, dict) else {}
 
-        channel_type = str(channel.get("type") or "").strip().lower()
-        message_type = "private" if channel_type in {"direct", "private"} else "group"
+        channel_type_raw = channel.get("type")
+        channel_type = str(channel_type_raw or "").strip().lower()
 
-        user_id = str(user.get("id") or member.get("id") or "").strip()
+        user_id = str(
+            user.get("id")
+            or user.get("user_id")
+            or member.get("id")
+            or member.get("user_id")
+            or ""
+        ).strip()
         if not user_id:
-            user_id = str((member.get("user") or {}).get("id") if isinstance(member.get("user"), dict) else "").strip()
+            user_id = str(
+                (member.get("user") or {}).get("id") if isinstance(member.get("user"), dict) else ""
+            ).strip()
         sender_name = str(
             member.get("nick")
             or member.get("name")
@@ -1063,7 +1095,12 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             or "unknown"
         ).strip()
 
-        message_id = str(message.get("id") or payload.get("id") or "").strip()
+        message_id = str(
+            message.get("id")
+            or message.get("message_id")
+            or payload.get("id")
+            or ""
+        ).strip()
         content = str(message.get("content") or "").strip()
         segments = self._satori_content_to_segments(content)
         raw_cq = self._segments_to_cq_text(segments)
@@ -1093,15 +1130,39 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             or self.cfg.satori_self_id
             or ""
         ).strip()
-        channel_id = str(channel.get("id") or "").strip()
+        channel_id = str(
+            channel.get("id")
+            or channel.get("channel_id")
+            or message.get("channel_id")
+            or payload.get("channel_id")
+            or ""
+        ).strip()
+        if channel_type in {"direct", "private", "dm"}:
+            message_type = "private"
+        elif channel_type in {"text", "group", "guild"}:
+            message_type = "group"
+        else:
+            # 部分实现不提供 channel.type，按 channel_id 形态兜底识别私聊。
+            lowered_channel_id = channel_id.lower()
+            message_type = (
+                "private"
+                if lowered_channel_id.startswith("private:")
+                or lowered_channel_id.startswith("dm:")
+                or lowered_channel_id.startswith("direct:")
+                else "group"
+            )
         if not channel_id or not user_id:
+            logging.warning(
+                "Satori message-created dropped: missing channel_id/user_id (keys=%s)",
+                sorted(payload.keys()),
+            )
             return None
-        group_id = str(guild.get("id") or channel_id).strip()
+        group_id = str(guild.get("id") or guild.get("guild_id") or channel_id).strip()
         route = {
             "platform": platform,
             "self_id": self_id,
             "channel_id": channel_id,
-            "guild_id": str(guild.get("id") or "").strip(),
+            "guild_id": str(guild.get("id") or guild.get("guild_id") or "").strip(),
             "user_id": user_id,
         }
 
@@ -1143,41 +1204,90 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                         ) as ws:
                             logging.info("Satori WS connected")
                             delay = max(1, self.cfg.reconnect_delay_sec)
-                            identified = False
-                            async for msg in ws:
-                                if msg.type == aiohttp.WSMsgType.TEXT:
-                                    try:
-                                        parsed = json.loads(msg.data)
-                                    except json.JSONDecodeError:
-                                        logging.warning("Satori non-JSON packet: %s", msg.data[:200])
-                                        continue
-                                    if not isinstance(parsed, dict):
-                                        logging.warning("Satori non-object packet: %s", msg.data[:200])
-                                        continue
-                                    op = parsed.get("op")
-                                    body_raw = parsed.get("body")
-                                    body = body_raw if isinstance(body_raw, dict) else {}
-                                    if op == 4:
-                                        # READY/RESPONSE 共用 op=4。只在首次 READY(logins) 后发送 identify。
-                                        if not identified and isinstance(body.get("logins"), list):
-                                            self._update_satori_default_route(body)
-                                            identify_body: dict[str, Any] = {}
-                                            token = self.cfg.satori_token.strip()
-                                            if token:
-                                                identify_body["token"] = token
-                                            await ws.send_str(
-                                                json.dumps({"op": 3, "body": identify_body}, ensure_ascii=False)
-                                            )
-                                            identified = True
-                                        continue
-                                    if op == 0:
-                                        event = self._convert_satori_event(body)
-                                        if event is None:
+                            identify_body: dict[str, Any] = {}
+                            token = self.cfg.satori_token.strip()
+                            if token:
+                                identify_body["token"] = token
+                            if self.satori_last_sn > 0:
+                                identify_body["sn"] = self.satori_last_sn
+                            # 按 Satori 协议：建立连接后主动 IDENTIFY，再接收 READY/EVENT。
+                            await ws.send_str(
+                                json.dumps({"op": 3, "body": identify_body}, ensure_ascii=False)
+                            )
+                            logging.info(
+                                "Satori IDENTIFY sent (token=%s sn=%s)",
+                                "set" if bool(token) else "empty",
+                                identify_body.get("sn"),
+                            )
+                            ping_task = asyncio.create_task(self._satori_ping_loop(ws))
+                            try:
+                                async for msg in ws:
+                                    if msg.type == aiohttp.WSMsgType.TEXT:
+                                        try:
+                                            parsed = json.loads(msg.data)
+                                        except json.JSONDecodeError:
+                                            logging.warning("Satori non-JSON packet: %s", msg.data[:200])
                                             continue
-                                        await self._handle_onebot_event(event)
+                                        if not isinstance(parsed, dict):
+                                            logging.warning("Satori non-object packet: %s", msg.data[:200])
+                                            continue
+                                        op_raw = parsed.get("op")
+                                        op: int | None
+                                        try:
+                                            op = int(op_raw) if op_raw is not None else None
+                                        except (TypeError, ValueError):
+                                            op = None
+                                        body_raw = parsed.get("body")
+                                        body = body_raw if isinstance(body_raw, dict) else {}
+
+                                        # 兼容某些实现直接推送 Event（无 op/body 包裹）。
+                                        if op is None and isinstance(parsed.get("type"), str):
+                                            op = 0
+                                            body = parsed
+
+                                        # READY：更新默认登录路由信息。
+                                        if op == 4:
+                                            self._update_satori_default_route(body)
+                                            logging.info("Satori READY received")
+                                            continue
+                                        # EVENT：处理消息事件，并更新 sn 以便断线续传。
+                                        if op == 0:
+                                            evt_type = str(body.get("type") or "").strip()
+                                            if evt_type:
+                                                logging.info(
+                                                    "Satori EVENT received: type=%s sn=%s",
+                                                    evt_type,
+                                                    body.get("sn"),
+                                                )
+                                            sn_value = body.get("sn")
+                                            try:
+                                                if sn_value is not None:
+                                                    self.satori_last_sn = int(sn_value)
+                                            except (TypeError, ValueError):
+                                                pass
+                                            event = self._convert_satori_event(body)
+                                            if event is None:
+                                                if evt_type:
+                                                    logging.info(
+                                                        "Satori EVENT ignored by bridge parser: type=%s sn=%s",
+                                                        evt_type,
+                                                        body.get("sn"),
+                                                    )
+                                                continue
+                                            await self._handle_onebot_event(event)
+                                            continue
+                                        # PONG/其它 op：当前无需处理。
+                                        if op not in {0, 1, 2, 4, 5, None}:
+                                            logging.info("Satori packet ignored: op=%s keys=%s", op_raw, sorted(parsed.keys()))
                                         continue
-                                elif msg.type in {aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED}:
-                                    break
+                                    if msg.type in {aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED}:
+                                        break
+                            finally:
+                                ping_task.cancel()
+                                try:
+                                    await ping_task
+                                except asyncio.CancelledError:
+                                    pass
                     except asyncio.CancelledError:
                         logging.info("Shutdown signal received, stopping Satori loop.")
                         break
