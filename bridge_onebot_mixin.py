@@ -1057,6 +1057,20 @@ class OneBotMixin:
         )
         return None, False
 
+    def _satori_payload_mentions_self(self, payload: dict[str, Any], self_qq: str) -> bool:
+        if not self_qq:
+            return False
+        content = str(payload.get("content") or "").strip()
+        if not content:
+            return False
+        parser = getattr(self, "_satori_content_to_segments", None)
+        parsed = (
+            self._extract_message_from_payload(parser(content), self_qq)
+            if callable(parser)
+            else self._extract_message_from_payload(content, self_qq)
+        )
+        return parsed.mentioned
+
     async def _augment_parsed_message(self, event: dict[str, Any], parsed: ParsedMessage) -> ParsedMessage:
         route = self._satori_route_from_event(event)
         if route is None:
@@ -1069,6 +1083,7 @@ class OneBotMixin:
         reply_blocks: list[str] = []
         forward_blocks: list[str] = []
         merged_images = list(parsed.images)
+        mentioned_in_context = False
 
         # 引用消息：按 message_id 拉取并结构化到上下文中。
         for reply_id in parsed.reply_ids[:2]:
@@ -1091,6 +1106,8 @@ class OneBotMixin:
                     history_index = await self._satori_history_message_index(route, limit=200)
                 history_data = history_index.get(reply_id)
                 if isinstance(history_data, dict):
+                    if self._satori_payload_mentions_self(history_data, self_qq):
+                        mentioned_in_context = True
                     block, images = self._build_satori_message_context_block(
                         "引用消息",
                         reply_id,
@@ -1102,6 +1119,8 @@ class OneBotMixin:
                     continue
                 fallback = quote_fallback_map.get(reply_id)
                 if fallback is not None:
+                    if fallback.mentioned:
+                        mentioned_in_context = True
                     block, images = self._build_parsed_context_block(
                         "引用消息",
                         reply_id,
@@ -1117,6 +1136,8 @@ class OneBotMixin:
                 )
                 reply_blocks.append("[引用消息]\n" f"- message_id: {reply_id}\n" f"- status: {status}")
                 continue
+            if self._satori_payload_mentions_self(data, self_qq):
+                mentioned_in_context = True
             block, images = self._build_satori_message_context_block("引用消息", reply_id, data, self_qq)
             reply_blocks.append(block)
             merged_images = self._merge_images(merged_images, images)
@@ -1138,6 +1159,8 @@ class OneBotMixin:
                 )
                 data = None
             if isinstance(data, dict):
+                if self._satori_payload_mentions_self(data, self_qq):
+                    mentioned_in_context = True
                 block, images = self._build_satori_message_context_block("转发消息", forward_id, data, self_qq)
                 forward_blocks.append(block)
                 merged_images = self._merge_images(merged_images, images)
@@ -1146,6 +1169,8 @@ class OneBotMixin:
                 history_index = await self._satori_history_message_index(route, limit=200)
             history_data = history_index.get(forward_id)
             if isinstance(history_data, dict):
+                if self._satori_payload_mentions_self(history_data, self_qq):
+                    mentioned_in_context = True
                 block, images = self._build_satori_message_context_block(
                     "转发消息",
                     forward_id,
@@ -1157,6 +1182,8 @@ class OneBotMixin:
                 continue
             fallback = quote_fallback_map.get(forward_id)
             if fallback is not None:
+                if fallback.mentioned:
+                    mentioned_in_context = True
                 block, images = self._build_parsed_context_block(
                     "转发消息",
                     forward_id,
@@ -1185,7 +1212,7 @@ class OneBotMixin:
 
         return ParsedMessage(
             text=text_out,
-            mentioned=parsed.mentioned,
+            mentioned=parsed.mentioned or mentioned_in_context,
             images=merged_images,
             reply_ids=list(parsed.reply_ids),
             forward_ids=list(parsed.forward_ids),

@@ -96,6 +96,16 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self._load_pairing_store()
 
     def _discard_bg_task(self, task: asyncio.Task[Any]) -> None:
+        if task.cancelled():
+            logging.info("Background task cancelled: name=%s", task.get_name())
+        else:
+            exc = task.exception()
+            if exc is not None:
+                logging.error(
+                    "Background task failed: name=%s err=%s",
+                    task.get_name(),
+                    exc,
+                )
         self.bg_tasks.discard(task)
 
     async def _private_wait_notice_loop(
@@ -992,17 +1002,53 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
 
     async def _handle_onebot_event(self, event: dict[str, Any]) -> None:
         message_id = event.get("message_id")
+        message_type = str(event.get("message_type") or "").strip()
+        user_id = str(event.get("user_id") or "").strip()
+        group_id = str(event.get("group_id") or "").strip()
+        logging.info(
+            "Handle event start: message_id=%s message_type=%s user_id=%s group_id=%s",
+            message_id,
+            message_type,
+            user_id,
+            group_id,
+        )
         if not self._mark_seen(message_id):
+            logging.info("Handle event skipped (seen): message_id=%s", message_id)
             return
 
         if not self._should_process_event(event):
+            logging.info(
+                "Handle event skipped (_should_process_event=false): message_id=%s message_type=%s",
+                message_id,
+                message_type,
+            )
             return
 
         session_key = self._build_session_key(event)
         self._bind_onebot_route(session_key, event)
         parsed = self._extract_message(event)
+        logging.info(
+            "Handle event parsed(base): message_id=%s session_key=%s text_len=%s images=%s reply_ids=%s forward_ids=%s mentioned=%s",
+            message_id,
+            session_key,
+            len((parsed.text or "").strip()),
+            len(parsed.images),
+            len(parsed.reply_ids),
+            len(parsed.forward_ids),
+            parsed.mentioned,
+        )
         try:
+            logging.info("Handle event augment begin: message_id=%s", message_id)
             parsed = await self._augment_parsed_message(event, parsed)
+            logging.info(
+                "Handle event augment done: message_id=%s text_len=%s images=%s reply_ids=%s forward_ids=%s mentioned=%s",
+                message_id,
+                len((parsed.text or "").strip()),
+                len(parsed.images),
+                len(parsed.reply_ids),
+                len(parsed.forward_ids),
+                parsed.mentioned,
+            )
         except Exception as exc:  # noqa: BLE001
             logging.warning(
                 "Message augment failed, continue with base parsed payload: message_id=%s err=%s",
@@ -1013,8 +1059,23 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
 
         should_reply, latest_text = self._should_reply(event, parsed)
         local_cmd = self._detect_local_command(latest_text, parsed.images)
+        logging.info(
+            "Handle event trigger decision: message_id=%s should_reply=%s local_cmd=%s latest_text_len=%s mentioned=%s",
+            message_id,
+            should_reply,
+            local_cmd or "",
+            len((latest_text or "").strip()),
+            parsed.mentioned,
+        )
         if local_cmd and (should_reply or self._is_admin_command(local_cmd)):
+            logging.info(
+                "Handle event local command dispatch: message_id=%s session_key=%s command=%s",
+                message_id,
+                session_key,
+                local_cmd,
+            )
             await self._handle_local_command(event, session_key, local_cmd)
+            logging.info("Handle event local command done: message_id=%s", message_id)
             return
 
         # Private chat: send user content directly to OpenClaw without local prompt building.
@@ -1025,8 +1086,10 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                     session_key,
                     normalized_text[:120],
                 )
+                logging.info("Handle event exit(private no reply): message_id=%s", message_id)
                 return
             if not await self._ensure_target_pairing(event, session_key):
+                logging.info("Handle event exit(private not paired): message_id=%s", message_id)
                 return
             task = asyncio.create_task(
                 self._process_message(
@@ -1037,19 +1100,40 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                     log_satori_event=True,
                 )
             )
+            logging.info(
+                "Handle event private task created: message_id=%s session_key=%s task=%s",
+                message_id,
+                session_key,
+                task.get_name(),
+            )
             self.bg_tasks.add(task)
             task.add_done_callback(self._discard_bg_task)
             return
 
         self._record_observation(event, session_key, parsed)
+        logging.info(
+            "Handle event observation recorded: message_id=%s session_key=%s should_reply=%s pending_size=%s",
+            message_id,
+            session_key,
+            should_reply,
+            len(self.pending_context[session_key]),
+        )
         if not should_reply:
+            logging.info("Handle event exit(group no reply): message_id=%s", message_id)
             return
         if not await self._ensure_target_pairing(event, session_key):
+            logging.info("Handle event exit(group not paired): message_id=%s", message_id)
             return
 
         pending = list(self.pending_context[session_key])
         self.pending_context[session_key].clear()
         latest_line = pending[-1].line if pending else latest_text.strip()
+        logging.info(
+            "Handle event building prompt: message_id=%s pending_count=%s latest_line_len=%s",
+            message_id,
+            len(pending),
+            len((latest_line or "").strip()),
+        )
 
         include_guidance = session_key not in self.session_prompt_bootstrapped
         prompt_text = self._build_prompt_from_pending(
@@ -1057,6 +1141,12 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             latest_line,
             include_guidance=include_guidance,
             bot_user_id=self._get_self_qq(event),
+        )
+        logging.info(
+            "Handle event prompt ready: message_id=%s prompt_len=%s include_guidance=%s",
+            message_id,
+            len(prompt_text),
+            include_guidance,
         )
         self.session_prompt_bootstrapped.add(session_key)
         image_candidates = self._collect_recent_images(pending)
@@ -1068,6 +1158,13 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 image_candidates,
                 log_satori_event=parsed.mentioned,
             )
+        )
+        logging.info(
+            "Handle event group task created: message_id=%s session_key=%s task=%s image_candidates=%s",
+            message_id,
+            session_key,
+            task.get_name(),
+            len(image_candidates),
         )
         self.bg_tasks.add(task)
         task.add_done_callback(self._discard_bg_task)
