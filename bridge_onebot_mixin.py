@@ -25,6 +25,8 @@ class OneBotMixin:
     pending_context: dict[str, deque[PendingObservation]]
     seen_ids: deque[str]
     seen_set: set[str]
+    cleared_processing_markers: deque[str]
+    cleared_processing_marker_set: set[str]
 
     def _onebot_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -597,29 +599,48 @@ class OneBotMixin:
             return None
         data = parsed
         if data.get("status") != "ok" and data.get("retcode") not in (0, None):
+            if self._is_onebot_idempotent_success(action, data):
+                logging.info(
+                    "OneBot action %s treated as idempotent success: retcode=%s message=%s",
+                    action,
+                    data.get("retcode"),
+                    str(data.get("wording") or data.get("message") or "").strip(),
+                )
+                return {}
             logging.warning("OneBot action %s retcode failed: %s", action, data)
             return None
         result = data.get("data")
         return result if isinstance(result, dict) else {}
 
+    @staticmethod
+    def _is_onebot_idempotent_success(action: str, data: dict[str, Any]) -> bool:
+        if action != "set_msg_emoji_like":
+            return False
+        retcode = data.get("retcode")
+        if retcode not in (200, "200"):
+            return False
+        msg = str(data.get("wording") or data.get("message") or "").strip()
+        normalized = re.sub(r"\s+", "", msg)
+        return "已经设置过该表情" in normalized or "已设置过该表情" in normalized
+
     async def _mark_processing_emoji(self, event: dict[str, Any]) -> dict[str, Any] | None:
-        if event.get("message_type") != "group":
-            return None
-        message_id = event.get("message_id")
-        if message_id is None:
+        marker = self._processing_marker_from_event(event)
+        if marker is None:
             return None
         payload = {
-            "message_id": message_id,
-            "emoji_id": self._PROCESSING_EMOJI_ID,
+            "message_id": marker["message_id"],
+            "emoji_id": marker["emoji_id"],
             "set": True,
         }
         result = await self._onebot_action("set_msg_emoji_like", payload, timeout_sec=8)
         if result is None:
+            logging.warning(
+                "Failed to set processing emoji: message_id=%s emoji_id=%s",
+                marker.get("message_id"),
+                marker.get("emoji_id"),
+            )
             return None
-        return {
-            "message_id": message_id,
-            "emoji_id": self._PROCESSING_EMOJI_ID,
-        }
+        return marker
 
     async def _clear_processing_emoji(self, marker: dict[str, Any] | None) -> None:
         if marker is None:
@@ -628,12 +649,49 @@ class OneBotMixin:
         emoji_id = marker.get("emoji_id")
         if message_id is None or emoji_id is None:
             return
+        marker_key = f"{message_id}:{emoji_id}"
+        if marker_key in self.cleared_processing_marker_set:
+            return
+        # 按 OneBot 扩展接口规范，仅使用 set_msg_emoji_like(set=false) 取消贴表情。
         payload = {
             "message_id": message_id,
             "emoji_id": emoji_id,
             "set": False,
         }
-        await self._onebot_action("set_msg_emoji_like", payload, timeout_sec=8)
+        result = await self._onebot_action("set_msg_emoji_like", payload, timeout_sec=8)
+        if result is not None:
+            self.cleared_processing_marker_set.add(marker_key)
+            self.cleared_processing_markers.append(marker_key)
+            maxlen = self.cleared_processing_markers.maxlen
+            if maxlen is not None:
+                while len(self.cleared_processing_markers) > maxlen:
+                    old = self.cleared_processing_markers.popleft()
+                    self.cleared_processing_marker_set.discard(old)
+            return
+        logging.warning(
+            "Failed to clear processing emoji: message_id=%s emoji_id=%s",
+            message_id,
+            emoji_id,
+        )
+        # 部分实现在重复状态下会返回 failed，但视觉结果可能已生效，这里仍做去重以免重复刷接口。
+        self.cleared_processing_marker_set.add(marker_key)
+        self.cleared_processing_markers.append(marker_key)
+        maxlen = self.cleared_processing_markers.maxlen
+        if maxlen is not None:
+            while len(self.cleared_processing_markers) > maxlen:
+                old = self.cleared_processing_markers.popleft()
+                self.cleared_processing_marker_set.discard(old)
+
+    def _processing_marker_from_event(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        if event.get("message_type") != "group":
+            return None
+        message_id = event.get("message_id")
+        if message_id is None:
+            return None
+        return {
+            "message_id": message_id,
+            "emoji_id": self._PROCESSING_EMOJI_ID,
+        }
 
     @staticmethod
     def _compact_text(text: str) -> str:
