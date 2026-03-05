@@ -897,15 +897,18 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         session_key: str,
         prompt_text: str,
         image_candidates: list[MessageImage],
+        *,
+        log_satori_event: bool,
     ) -> None:
         async with self.sem:
-            log_io(
-                source="satori",
-                direction="satori -> bridge",
-                content="接收消息事件",
-                received=self._event_log_brief(event),
-                sent=None,
-            )
+            if log_satori_event:
+                log_io(
+                    source="satori",
+                    direction="satori -> bridge",
+                    content="接收消息事件",
+                    received=self._event_log_brief(event),
+                    sent=None,
+                )
 
             processing_marker: dict[str, Any] | None = None
             try:
@@ -1024,6 +1027,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                     session_key,
                     latest_text,
                     parsed.images,
+                    log_satori_event=True,
                 )
             )
             self.bg_tasks.add(task)
@@ -1032,12 +1036,6 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
 
         self._record_observation(event, session_key, parsed)
         if not should_reply:
-            logging.info(
-                "Satori group message observed only (not triggering reply): key=%s text=%s mentioned=%s",
-                session_key,
-                normalized_text[:120],
-                parsed.mentioned,
-            )
             return
         if not await self._ensure_target_pairing(event, session_key):
             return
@@ -1051,6 +1049,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             pending,
             latest_line,
             include_guidance=include_guidance,
+            bot_user_id=self._get_self_qq(event),
         )
         self.session_prompt_bootstrapped.add(session_key)
         image_candidates = self._collect_recent_images(pending)
@@ -1060,6 +1059,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 session_key,
                 prompt_text,
                 image_candidates,
+                log_satori_event=parsed.mentioned,
             )
         )
         self.bg_tasks.add(task)

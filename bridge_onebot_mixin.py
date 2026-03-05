@@ -462,7 +462,12 @@ class OneBotMixin:
         )
 
     def _build_prompt_from_pending(
-        self, pending: list[PendingObservation], latest_line: str, include_guidance: bool = True
+        self,
+        pending: list[PendingObservation],
+        latest_line: str,
+        include_guidance: bool = True,
+        *,
+        bot_user_id: str = "",
     ) -> str:
         recent = pending[-max(1, self.cfg.context_flush_limit) :]
         # 触发消息会先写入 pending，这里将历史与当前待回复消息拆开，避免重复占用 token。
@@ -483,6 +488,7 @@ class OneBotMixin:
 
         history_lines = [self._format_observation_item(item) for item in history]
         history_block = "\n\n".join(history_lines) if history_lines else "（无）"
+        bot_id = (bot_user_id or "").strip() or "unknown"
 
         rule_block = (
             "规则：\n"
@@ -490,7 +496,8 @@ class OneBotMixin:
             "2) 只能使用 user_id 作为 QQ 号；如需@，仅可输出 `<at id=\"<user_id>\"/>`。\n"
             "3) 默认@发送者，除非被要求不@发送者。\n"
             f"4) 当前待回复消息发送者 user_id: {current_sender_id}\n"
-            "5) 默认使用简洁纯文本回复；仅当用户明确要求 Markdown 时，才使用 Markdown。"
+            f"5) 当前机器人 user_id: {bot_id}；当 `<at id=\"{bot_id}\"/>` 出现时，表示在@你。\n"
+            "6) 默认使用简洁纯文本回复；仅当用户明确要求 Markdown 时，才使用 Markdown。"
         )
         if not include_guidance:
             return (
