@@ -43,7 +43,9 @@ class OneBotMixin:
         raw = event.get("_satori_route")
         if isinstance(raw, dict):
             channel_id = str(raw.get("channel_id") or "").strip()
-            platform = str(raw.get("platform") or self.cfg.satori_platform or "").strip()
+            platform = str(
+                raw.get("platform") or self.cfg.satori_platform or ""
+            ).strip()
             self_id = str(raw.get("self_id") or self.cfg.satori_self_id or "").strip()
             if channel_id and platform and self_id:
                 return {
@@ -62,7 +64,9 @@ class OneBotMixin:
     ) -> dict[str, Any] | None:
         assert self.session is not None
         if route is None:
-            logging.warning("api.satori action=%s status=skip reason=missing_route", action)
+            logging.warning(
+                "api.satori action=%s status=skip reason=missing_route", action
+            )
             return None
         headers = self._onebot_headers()
         headers["Satori-Platform"] = route["platform"]
@@ -73,7 +77,9 @@ class OneBotMixin:
                 url,
                 headers=headers,
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=timeout_sec) if timeout_sec else None,
+                timeout=(
+                    aiohttp.ClientTimeout(total=timeout_sec) if timeout_sec else None
+                ),
             ) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
@@ -135,7 +141,9 @@ class OneBotMixin:
         return f'<at id="{escape(target_value, quote=True)}"/>'
 
     @staticmethod
-    def _merge_images(primary: list[MessageImage], secondary: list[MessageImage]) -> list[MessageImage]:
+    def _merge_images(
+        primary: list[MessageImage], secondary: list[MessageImage]
+    ) -> list[MessageImage]:
         merged: list[MessageImage] = []
         seen: set[str] = set()
         for img in [*primary, *secondary]:
@@ -179,7 +187,9 @@ class OneBotMixin:
                     continue
                 data_raw = seg.get("data")
                 data = data_raw if isinstance(data_raw, dict) else {}
-                seg_type = str(seg.get("type") or data.get("type") or "").strip().lower()
+                seg_type = (
+                    str(seg.get("type") or data.get("type") or "").strip().lower()
+                )
 
                 def _read(*keys: str) -> str:
                     for key in keys:
@@ -196,14 +206,18 @@ class OneBotMixin:
                     if text_value:
                         text_parts.append(text_value)
                 elif seg_type == "at":
-                    at_type = str(
-                        data.get("at_type")
-                        or data.get("mention_type")
-                        or data.get("type")
-                        or seg.get("at_type")
-                        or seg.get("mention_type")
-                        or ""
-                    ).strip().lower()
+                    at_type = (
+                        str(
+                            data.get("at_type")
+                            or data.get("mention_type")
+                            or data.get("type")
+                            or seg.get("at_type")
+                            or seg.get("mention_type")
+                            or ""
+                        )
+                        .strip()
+                        .lower()
+                    )
                     mention_id = _read("id", "qq", "user_id", "userId").strip()
                     if at_type == "all":
                         text_parts.append(self._mention_tag("", mention_type="all"))
@@ -227,10 +241,14 @@ class OneBotMixin:
                     else:
                         text_parts.append("<quote/>")
                 elif seg_type in {"forward", "longmsg"}:
-                    fwd_id = _read("id", "message_id", "messageId", "resid", "res_id").strip()
+                    fwd_id = _read(
+                        "id", "message_id", "messageId", "resid", "res_id"
+                    ).strip()
                     if fwd_id:
                         forward_ids.append(fwd_id)
-                        text_parts.append(f'<message id="{escape(fwd_id, quote=True)}" forward/>')
+                        text_parts.append(
+                            f'<message id="{escape(fwd_id, quote=True)}" forward/>'
+                        )
                     else:
                         text_parts.append("<message forward/>")
             text = re.sub(r"\s+", " ", "".join(text_parts)).strip()
@@ -250,17 +268,27 @@ class OneBotMixin:
                     return self._extract_message_from_payload(parsed_segments, self_qq)
 
             text = re.sub(r"\s+", " ", payload).strip()
-            return ParsedMessage(text=text, mentioned=False, images=[], reply_ids=[], forward_ids=[])
+            return ParsedMessage(
+                text=text, mentioned=False, images=[], reply_ids=[], forward_ids=[]
+            )
 
-        return ParsedMessage(text="", mentioned=False, images=[], reply_ids=[], forward_ids=[])
+        return ParsedMessage(
+            text="", mentioned=False, images=[], reply_ids=[], forward_ids=[]
+        )
 
     def _extract_message(self, event: dict[str, Any]) -> ParsedMessage:
         self_qq = self._get_self_qq(event)
         parsed_main = self._extract_message_from_payload(event.get("message"), self_qq)
-        parsed_raw = self._extract_message_from_payload(event.get("raw_message"), self_qq)
+        parsed_raw = self._extract_message_from_payload(
+            event.get("raw_message"), self_qq
+        )
         merged_images = self._merge_images(parsed_main.images, parsed_raw.images)
-        merged_reply_ids = self._merge_str_list(parsed_main.reply_ids, parsed_raw.reply_ids)
-        merged_forward_ids = self._merge_str_list(parsed_main.forward_ids, parsed_raw.forward_ids)
+        merged_reply_ids = self._merge_str_list(
+            parsed_main.reply_ids, parsed_raw.reply_ids
+        )
+        merged_forward_ids = self._merge_str_list(
+            parsed_main.forward_ids, parsed_raw.forward_ids
+        )
         text = parsed_main.text or parsed_raw.text
         return ParsedMessage(
             text=text,
@@ -284,7 +312,11 @@ class OneBotMixin:
 
     @staticmethod
     def _format_observation_line(
-        sender_name: str, sender_qq: str, normalized_text: str, images: list[MessageImage], ts: float
+        sender_name: str,
+        sender_qq: str,
+        normalized_text: str,
+        images: list[MessageImage],
+        ts: float,
     ) -> str:
         display = normalized_text or "（无文本）"
         # Keep a compact fallback line for logs/debug.
@@ -330,7 +362,9 @@ class OneBotMixin:
             ts = float(ts_raw) if ts_raw is not None else datetime.now().timestamp()
         except (TypeError, ValueError):
             ts = datetime.now().timestamp()
-        line = self._format_observation_line(sender_name, sender_qq, normalized_text, images, ts)
+        line = self._format_observation_line(
+            sender_name, sender_qq, normalized_text, images, ts
+        )
         self.pending_context[session_key].append(
             PendingObservation(
                 line=line,
@@ -429,7 +463,9 @@ class OneBotMixin:
             return None
         return f"op {action} {target_uid}"
 
-    def _detect_local_command(self, text: str, images: list[MessageImage]) -> str | None:
+    def _detect_local_command(
+        self, text: str, images: list[MessageImage]
+    ) -> str | None:
         if images:
             return None
         stripped = (text or "").strip()
@@ -457,7 +493,10 @@ class OneBotMixin:
             ),
             (r"/?unpair", lambda _m: "unpair"),
             (r"/?op(?:\s+(?:list|ls))?", lambda _m: "op list"),
-            (r"/?op\s+(?:add|\+)\s+(.+)", lambda m: OneBotMixin._build_op_command("add", m.group(1))),
+            (
+                r"/?op\s+(?:add|\+)\s+(.+)",
+                lambda m: OneBotMixin._build_op_command("add", m.group(1)),
+            ),
             (
                 r"/?op\s+(?:del|remove|rm|-)\s+(.+)",
                 lambda m: OneBotMixin._build_op_command("del", m.group(1)),
@@ -496,8 +535,15 @@ class OneBotMixin:
         # 触发消息会先写入 pending，这里将历史与当前待回复消息拆开，避免重复占用 token。
         history = recent[:-1] if len(recent) > 1 else []
         latest_obs = recent[-1] if recent else None
-        current_sender_id = latest_obs.sender_id if latest_obs is not None else "unknown"
-        current_message_id = latest_obs.message_id if latest_obs is not None else "unknown"
+
+        current_sender_id = (
+            latest_obs.sender_id if latest_obs is not None else "unknown"
+        )
+        current_message_id = (
+            latest_obs.message_id if latest_obs is not None else "unknown"
+        )
+        bot_id = (bot_user_id or "").strip() or "unknown"
+
         if latest_obs is not None:
             current_block = self._format_observation_item(latest_obs)
         else:
@@ -512,47 +558,47 @@ class OneBotMixin:
             )
 
         history_lines = [self._format_observation_item(item) for item in history]
-        history_block = "\n\n".join(history_lines) if history_lines else "（无）"
-        bot_id = (bot_user_id or "").strip() or "unknown"
-
-        rule_block = (
-            "规则：\n"
-            "1) user_name 可能包含数字（例如“我是1354987”），这不是 QQ 号。\n"
-            "2) 只能使用 user_id 作为 QQ 号；如需@，仅可输出 `<at id=\"<user_id>\"/>`。\n"
-            "3) 默认同时@当前发送者并引用其消息：优先在回复开头使用 `<quote id=\"<message_id>\"/>` 引用当前待回复消息，再使用 `<at id=\"<user_id>\"/>`；除非被明确要求不@或不引用。若无法同时做到，可以只@或只引用。\n"
-            f"4) 当前待回复消息发送者 user_id: {current_sender_id}\n"
-            f"5) 当前待回复消息 message_id: {current_message_id}\n"
-            f"6) 当前机器人 user_id: {bot_id}；当 `<at id=\"{bot_id}\"/>` 出现时，表示在@你。\n"
-            "7) 回复内容使用 Satori message content 格式；可使用 `<at/>`、`<quote/>`、`<img/>` 等元素与文本混排。\n"
-            "8) 仅可使用上下文中出现过的 message_id（如当前消息 message_id/reply_ids/forward_ids）进行引用，禁止编造。\n"
-            "9) 默认保持简洁；仅当用户明确要求 Markdown 时，才使用 Markdown。"
-        )
-        if not include_guidance:
-            return (
-                "历史记录（不含当前消息，每条分行结构化字段）：\n"
-                + "```text\n"
-                + history_block
-                + "\n```\n"
-                + "当前待回复消息：\n"
-                + "```text\n"
-                + current_block
-                + "\n```\n"
-                + rule_block
-            )
-        return (
-            "你正在 QQ 群聊中对话，请结合历史继续当前话题并直接回复用户。\n"
-            + "历史记录（不含当前消息，按时间顺序，每条分行结构化字段）：\n"
-            + "```text\n"
-            + history_block
-            + "\n```\n"
-            + "当前待回复消息：\n"
-            + "```text\n"
-            + current_block
-            + "\n```\n"
-            + rule_block
+        history_block = (
+            "\n\n".join(history_lines) if history_lines else "（无历史记录）"
         )
 
-    def _collect_recent_images(self, pending: list[PendingObservation]) -> list[MessageImage]:
+        # 将零散的规则归类为三大模块，并使用 Markdown 加粗强调核心约束
+        rule_block = f"""<rules>
+1. 【身份与识别】
+   - 你的 user_id 是：{bot_id}。当 `<at id="{bot_id}"/>` 出现时，代表用户在@你。
+   - 用户的 user_name 可能包含纯数字（如“我是1354987”），这只是昵称，**绝不可将其作为 QQ 号（user_id）**。
+
+2. 【格式与语法】
+   - 必须使用 Satori 格式标签与文本混排，支持：`<at id="user_id"/>`、`<quote id="message_id"/>`、`<img src="url"/>`。
+   - **默认保持纯文本简洁回复**，仅当用户明确要求使用 Markdown 时才使用。
+
+3. 【回复规范】
+   - 默认行为：在回复开头优先使用 `<quote id="{current_message_id}"/>` 引用当前待回复消息，再使用 `<at id="{current_sender_id}"/>` 提及当前发送者（除非被明确要求不这么做）。
+   - 引用限制：**仅可使用上下文中出现过的 message_id**（如 reply_ids/forward_ids 等）进行引用，严禁编造 id。
+</rules>"""
+
+        # 利用清晰的 XML 结构将上下文隔离
+        guidance = (
+            "你正在 QQ 群聊中对话，请结合历史继续当前话题并直接回复用户。\n\n"
+            if include_guidance
+            else ""
+        )
+
+        prompt = f"""{guidance}<history>
+{history_block}
+</history>
+
+<current_message>
+{current_block}
+</current_message>
+
+{rule_block}"""
+
+        return prompt.strip()
+
+    def _collect_recent_images(
+        self, pending: list[PendingObservation]
+    ) -> list[MessageImage]:
         out: list[MessageImage] = []
         seen: set[str] = set()
         for obs in reversed(pending):
@@ -601,7 +647,9 @@ class OneBotMixin:
             "channel_id": route["channel_id"],
             "content": outgoing,
         }
-        result = await self._satori_action("message.create", payload, route, timeout_sec=12)
+        result = await self._satori_action(
+            "message.create", payload, route, timeout_sec=12
+        )
         if result is None:
             raise RuntimeError("Satori message.create failed")
 
@@ -616,7 +664,9 @@ class OneBotMixin:
         )
         return bool(pattern.search(text or ""))
 
-    async def _mark_processing_emoji(self, event: dict[str, Any]) -> dict[str, Any] | None:
+    async def _mark_processing_emoji(
+        self, event: dict[str, Any]
+    ) -> dict[str, Any] | None:
         now = datetime.now().timestamp()
         if self.satori_reaction_disabled_until > now:
             return None
@@ -628,10 +678,14 @@ class OneBotMixin:
             "message_id": marker["message_id"],
             "emoji_id": marker["emoji_id"],
         }
-        result = await self._satori_action("reaction.create", payload, marker["route"], timeout_sec=8)
+        result = await self._satori_action(
+            "reaction.create", payload, marker["route"], timeout_sec=8
+        )
         if result is None:
             self.satori_reaction_disabled_until = now + 600
-            self.satori_reaction_disable_reason = "reaction.create failed (platform not supported or broken)"
+            self.satori_reaction_disable_reason = (
+                "reaction.create failed (platform not supported or broken)"
+            )
             logging.warning(
                 "reaction stage=mark status=failed action=reaction.create message_id=%s emoji_id=%s disable_sec=600",
                 marker.get("message_id"),
@@ -656,7 +710,9 @@ class OneBotMixin:
             "message_id": message_id,
             "emoji_id": str(emoji_id),
         }
-        result = await self._satori_action("reaction.delete", payload, route, timeout_sec=8)
+        result = await self._satori_action(
+            "reaction.delete", payload, route, timeout_sec=8
+        )
         if result is not None:
             self.cleared_processing_marker_set.add(marker_key)
             self.cleared_processing_markers.append(marker_key)
@@ -681,7 +737,9 @@ class OneBotMixin:
                 old = self.cleared_processing_markers.popleft()
                 self.cleared_processing_marker_set.discard(old)
 
-    def _processing_marker_from_event(self, event: dict[str, Any]) -> dict[str, Any] | None:
+    def _processing_marker_from_event(
+        self, event: dict[str, Any]
+    ) -> dict[str, Any] | None:
         if event.get("message_type") != "group":
             return None
         message_id = event.get("message_id")
@@ -711,7 +769,9 @@ class OneBotMixin:
             return raw
         return raw[: max(1, max_len - 1)].rstrip() + "…"
 
-    def _sender_name_id_from_message_record(self, record: dict[str, Any]) -> tuple[str, str]:
+    def _sender_name_id_from_message_record(
+        self, record: dict[str, Any]
+    ) -> tuple[str, str]:
         sender_raw = record.get("sender")
         sender = sender_raw if isinstance(sender_raw, dict) else {}
         sender_id = str(
@@ -721,24 +781,37 @@ class OneBotMixin:
             or sender.get("id")
             or "unknown"
         ).strip()
-        sender_name = str(sender.get("card") or sender.get("nickname") or sender_id).strip() or sender_id
+        sender_name = (
+            str(sender.get("card") or sender.get("nickname") or sender_id).strip()
+            or sender_id
+        )
         return sender_name, sender_id or "unknown"
 
-    def _parse_message_record_payload(self, record: dict[str, Any], self_qq: str) -> ParsedMessage:
+    def _parse_message_record_payload(
+        self, record: dict[str, Any], self_qq: str
+    ) -> ParsedMessage:
         parsed_main = self._extract_message_from_payload(record.get("message"), self_qq)
-        parsed_raw = self._extract_message_from_payload(record.get("raw_message"), self_qq)
+        parsed_raw = self._extract_message_from_payload(
+            record.get("raw_message"), self_qq
+        )
         return ParsedMessage(
             text=parsed_main.text or parsed_raw.text,
             mentioned=parsed_main.mentioned or parsed_raw.mentioned,
             images=self._merge_images(parsed_main.images, parsed_raw.images),
             reply_ids=self._merge_str_list(parsed_main.reply_ids, parsed_raw.reply_ids),
-            forward_ids=self._merge_str_list(parsed_main.forward_ids, parsed_raw.forward_ids),
+            forward_ids=self._merge_str_list(
+                parsed_main.forward_ids, parsed_raw.forward_ids
+            ),
         )
 
-    def _build_reply_context_block(self, record: dict[str, Any], self_qq: str) -> tuple[str, list[MessageImage]]:
+    def _build_reply_context_block(
+        self, record: dict[str, Any], self_qq: str
+    ) -> tuple[str, list[MessageImage]]:
         sender_name, sender_id = self._sender_name_id_from_message_record(record)
         parsed = self._parse_message_record_payload(record, self_qq)
-        content = self._truncate_text(self._compact_text(parsed.text or "（无文本）"), 300)
+        content = self._truncate_text(
+            self._compact_text(parsed.text or "（无文本）"), 300
+        )
         block = (
             "[引用消息]\n"
             f"- user_name: {sender_name}\n"
@@ -760,7 +833,12 @@ class OneBotMixin:
                 continue
             sender_raw = raw_node.get("sender")
             sender = sender_raw if isinstance(sender_raw, dict) else {}
-            node_name = str(sender.get("name") or sender.get("nickname") or sender.get("card") or "unknown")
+            node_name = str(
+                sender.get("name")
+                or sender.get("nickname")
+                or sender.get("card")
+                or "unknown"
+            )
             node_id = str(
                 sender.get("user_id")
                 or sender.get("uin")
@@ -773,7 +851,9 @@ class OneBotMixin:
                 content_payload = raw_node.get("message")
             parsed = self._extract_message_from_payload(content_payload, self_qq)
             out_images = self._merge_images(out_images, parsed.images)
-            node_content = self._truncate_text(self._compact_text(parsed.text or "（无文本）"), 240)
+            node_content = self._truncate_text(
+                self._compact_text(parsed.text or "（无文本）"), 240
+            )
             lines.append(
                 f"- node_{idx}:\n"
                 f"  user_name: {node_name}\n"
@@ -968,7 +1048,9 @@ class OneBotMixin:
                 depth=depth,
                 seen_forward_ids=seen_forward_ids,
             )
-            node_msg_id = str(raw_node.get("message_id") or raw_node.get("id") or "").strip()
+            node_msg_id = str(
+                raw_node.get("message_id") or raw_node.get("id") or ""
+            ).strip()
             msg_open = (
                 f'<message id="{escape(node_msg_id, quote=True)}">'
                 if node_msg_id
@@ -1021,7 +1103,9 @@ class OneBotMixin:
             timeout_sec=10,
         )
         try:
-            raw_internal_text = json.dumps(internal_raw, ensure_ascii=False, separators=(",", ":"))
+            raw_internal_text = json.dumps(
+                internal_raw, ensure_ascii=False, separators=(",", ":")
+            )
         except Exception:  # noqa: BLE001
             raw_internal_text = str(internal_raw)
         if len(raw_internal_text) > 12000:
@@ -1063,10 +1147,14 @@ class OneBotMixin:
                 for item in msg_raw:
                     if not isinstance(item, dict):
                         continue
-                    node_id = str(item.get("message_id") or item.get("id") or "").strip()
+                    node_id = str(
+                        item.get("message_id") or item.get("id") or ""
+                    ).strip()
                     if node_id:
                         node_ids.append(node_id)
-                preview = re.sub(r"\s+", " ", str(synthesized.get("content") or "")).strip()
+                preview = re.sub(
+                    r"\s+", " ", str(synthesized.get("content") or "")
+                ).strip()
                 if len(preview) > 240:
                     preview = preview[:239].rstrip() + "…"
                 logging.info(
@@ -1085,7 +1173,9 @@ class OneBotMixin:
         )
         return None, False
 
-    async def _augment_parsed_message(self, event: dict[str, Any], parsed: ParsedMessage) -> ParsedMessage:
+    async def _augment_parsed_message(
+        self, event: dict[str, Any], parsed: ParsedMessage
+    ) -> ParsedMessage:
         route = self._satori_route_from_event(event)
         if route is None:
             return parsed
@@ -1122,7 +1212,9 @@ class OneBotMixin:
                 data = None
             if not isinstance(data, dict):
                 if history_index is None:
-                    history_index = await self._satori_history_message_index(route, limit=200)
+                    history_index = await self._satori_history_message_index(
+                        route, limit=200
+                    )
                 history_data = history_index.get(reply_id)
                 if isinstance(history_data, dict):
                     block, images = self._build_satori_message_context_block(
@@ -1149,9 +1241,13 @@ class OneBotMixin:
                     if reply_id in quote_id_set
                     else "无法拉取引用消息内容"
                 )
-                reply_blocks.append("[引用消息]\n" f"- message_id: {reply_id}\n" f"- status: {status}")
+                reply_blocks.append(
+                    "[引用消息]\n" f"- message_id: {reply_id}\n" f"- status: {status}"
+                )
                 continue
-            block, images = self._build_satori_message_context_block("引用消息", reply_id, data, self_qq)
+            block, images = self._build_satori_message_context_block(
+                "引用消息", reply_id, data, self_qq
+            )
             reply_blocks.append(block)
             merged_images = self._merge_images(merged_images, images)
 
@@ -1172,12 +1268,16 @@ class OneBotMixin:
                 )
                 data = None
             if isinstance(data, dict):
-                block, images = self._build_satori_message_context_block("转发消息", forward_id, data, self_qq)
+                block, images = self._build_satori_message_context_block(
+                    "转发消息", forward_id, data, self_qq
+                )
                 forward_blocks.append(block)
                 merged_images = self._merge_images(merged_images, images)
                 continue
             if history_index is None:
-                history_index = await self._satori_history_message_index(route, limit=200)
+                history_index = await self._satori_history_message_index(
+                    route, limit=200
+                )
             history_data = history_index.get(forward_id)
             if isinstance(history_data, dict):
                 block, images = self._build_satori_message_context_block(
@@ -1205,9 +1305,7 @@ class OneBotMixin:
                 else "当前平台不支持按该 id 拉取转发节点详情"
             )
             forward_blocks.append(
-                "[转发消息]\n"
-                f"- message_id: {forward_id}\n"
-                f"- status: {status}"
+                "[转发消息]\n" f"- message_id: {forward_id}\n" f"- status: {status}"
             )
 
         text_out = parsed.text
@@ -1268,7 +1366,9 @@ class OneBotMixin:
 
         parse_attrs = getattr(self, "_satori_parse_tag_attrs", None)
         parse_segments = getattr(self, "_satori_content_to_segments", None)
-        quote_pattern = re.compile(r"<quote\b([^>]*)>(.*?)</quote>", flags=re.IGNORECASE | re.DOTALL)
+        quote_pattern = re.compile(
+            r"<quote\b([^>]*)>(.*?)</quote>", flags=re.IGNORECASE | re.DOTALL
+        )
         for matched in quote_pattern.finditer(content):
             attr_text = matched.group(1) or ""
             attrs: dict[str, str] = {}
@@ -1280,7 +1380,9 @@ class OneBotMixin:
             if not quote_id:
                 continue
             quote_inner = matched.group(2) or ""
-            payload = parse_segments(quote_inner) if callable(parse_segments) else quote_inner
+            payload = (
+                parse_segments(quote_inner) if callable(parse_segments) else quote_inner
+            )
             parsed = self._extract_message_from_payload(payload, self_qq)
             out[quote_id] = parsed
         return out
@@ -1316,7 +1418,9 @@ class OneBotMixin:
         user_id: str = "unknown",
         status: str = "",
     ) -> tuple[str, list[MessageImage]]:
-        preview = self._truncate_text(self._compact_text(parsed.text or "（无文本）"), 300)
+        preview = self._truncate_text(
+            self._compact_text(parsed.text or "（无文本）"), 300
+        )
         reply_ids = ", ".join(parsed.reply_ids) if parsed.reply_ids else "null"
         forward_ids = ", ".join(parsed.forward_ids) if parsed.forward_ids else "null"
         lines = [
@@ -1401,7 +1505,9 @@ class OneBotMixin:
             return guessed
         return "image/jpeg"
 
-    async def _build_image_attachments(self, images: list[MessageImage]) -> list[dict[str, str]]:
+    async def _build_image_attachments(
+        self, images: list[MessageImage]
+    ) -> list[dict[str, str]]:
         assert self.session is not None
         if not images:
             return []
@@ -1414,7 +1520,9 @@ class OneBotMixin:
                 break
             url = img.url.strip()
             if not url:
-                logging.warning("media.image stage=skip reason=missing_url file=%s", img.file)
+                logging.warning(
+                    "media.image stage=skip reason=missing_url file=%s", img.file
+                )
                 continue
             if not (url.startswith("http://") or url.startswith("https://")):
                 logging.warning(
@@ -1449,6 +1557,8 @@ class OneBotMixin:
                     }
                 )
             except Exception as exc:  # noqa: BLE001
-                logging.warning("media.image stage=fetch status=failed url=%s err=%s", url, exc)
+                logging.warning(
+                    "media.image stage=fetch status=failed url=%s err=%s", url, exc
+                )
 
         return out
