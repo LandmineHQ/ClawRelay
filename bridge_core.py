@@ -194,6 +194,17 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
     @staticmethod
     def _event_log_brief(event: dict[str, Any]) -> dict[str, Any]:
         raw_msg = str(event.get("raw_message") or "").strip()
+        has_images = bool(re.search(r"<(?:img|image)\b", raw_msg, flags=re.IGNORECASE))
+        if not has_images:
+            message_raw = event.get("message")
+            if isinstance(message_raw, list):
+                for seg in message_raw:
+                    if not isinstance(seg, dict):
+                        continue
+                    seg_type = str(seg.get("type") or "").strip().lower()
+                    if seg_type in {"img", "image"}:
+                        has_images = True
+                        break
         return {
             "message_id": str(event.get("message_id") or "").strip(),
             "message_type": str(event.get("message_type") or "").strip(),
@@ -201,7 +212,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             "group_id": str(event.get("group_id") or "").strip(),
             "session_self_id": str(event.get("self_id") or "").strip(),
             "raw_message": raw_msg[:240] + ("…" if len(raw_msg) > 240 else ""),
-            "has_images": "[CQ:image" in raw_msg or "[图片:" in raw_msg,
+            "has_images": has_images,
         }
 
     @staticmethod
@@ -648,13 +659,13 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
 
     @staticmethod
     def _extract_user_id_from_command(command: str) -> str:
-        cq_matched = re.search(
-            r"\[cq:at,[^\]]*qq=(\d{5,20})[^\]]*\]",
+        at_matched = re.search(
+            r"<at\b[^>]*\bid\s*=\s*(?:\"|')?(\d{5,20})(?:\"|')?[^>]*\/?>",
             command or "",
             flags=re.IGNORECASE,
         )
-        if cq_matched:
-            return cq_matched.group(1)
+        if at_matched:
+            return at_matched.group(1)
         matched = re.search(r"\d{5,20}", command or "")
         return matched.group(0) if matched else ""
 
@@ -1101,7 +1112,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         for matched in tag_pattern.finditer(text):
             plain = unescape(text[last : matched.start()])
             if plain and quote_depth == 0:
-                out.append({"type": "text", "data": {"text": plain}})
+                out.append({"type": "text", "text": plain})
             last = matched.end()
             is_close = matched.group(1) == "/"
             tag_name = matched.group(2).lower()
@@ -1113,53 +1124,32 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 attrs = cls._satori_parse_tag_attrs(matched.group(3) or "")
                 msg_id = attrs.get("id") or ""
                 if msg_id and quote_depth == 0:
-                    out.append({"type": "reply", "data": {"id": msg_id}})
+                    out.append({"type": "quote", "id": msg_id})
                 quote_depth += 1
                 continue
             if is_close or quote_depth > 0:
                 continue
             attrs = cls._satori_parse_tag_attrs(matched.group(3) or "")
             if tag_name == "at":
-                target = attrs.get("id") or attrs.get("qq") or attrs.get("type")
-                if target:
-                    out.append({"type": "at", "data": {"qq": str(target)}})
+                seg: dict[str, Any] = {"type": "at"}
+                at_id = str(attrs.get("id") or attrs.get("qq") or "").strip()
+                at_type = str(attrs.get("type") or "").strip()
+                if at_id:
+                    seg["id"] = at_id
+                if at_type:
+                    seg["at_type"] = at_type
+                if len(seg) > 1:
+                    out.append(seg)
                 continue
             if tag_name in {"img", "image"}:
                 src = attrs.get("src") or attrs.get("url") or ""
                 if src:
-                    out.append({"type": "image", "data": {"url": src, "file": ""}})
+                    out.append({"type": "img", "src": src})
                 continue
         tail = unescape(text[last:])
         if tail and quote_depth == 0:
-            out.append({"type": "text", "data": {"text": tail}})
+            out.append({"type": "text", "text": tail})
         return out
-
-    @staticmethod
-    def _segments_to_cq_text(segments: list[dict[str, Any]]) -> str:
-        parts: list[str] = []
-        for seg in segments:
-            seg_type = str(seg.get("type", "")).strip().lower()
-            data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
-            if seg_type == "text":
-                parts.append(str(data.get("text", "")))
-                continue
-            if seg_type == "at":
-                qq = str(data.get("qq", "")).strip()
-                if qq:
-                    parts.append(f"[CQ:at,qq={qq}]")
-                continue
-            if seg_type == "image":
-                url = str(data.get("url", "")).strip()
-                if url:
-                    parts.append(f"[CQ:image,url={url}]")
-                else:
-                    parts.append("[CQ:image]")
-                continue
-            if seg_type in {"reply", "quote"}:
-                msg_id = str(data.get("id", "")).strip()
-                if msg_id:
-                    parts.append(f"[CQ:reply,id={msg_id}]")
-        return "".join(parts).strip()
 
     def _update_satori_default_route(self, payload_body: dict[str, Any]) -> None:
         logins = payload_body.get("logins")
@@ -1234,7 +1224,6 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         ).strip()
         content = str(message.get("content") or "").strip()
         segments = self._satori_content_to_segments(content)
-        raw_cq = self._segments_to_cq_text(segments)
 
         ts_raw = payload.get("timestamp") or message.get("created_at") or time.time() * 1000
         try:
@@ -1311,9 +1300,9 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 "nickname": sender_name,
                 "card": sender_name if message_type == "group" else "",
             },
-            "raw_message": raw_cq or content,
+            "raw_message": content,
             "message": segments,
-            "message_format": "array",
+            "message_format": "satori",
             "_satori_route": route,
             "_satori_event": payload,
         }

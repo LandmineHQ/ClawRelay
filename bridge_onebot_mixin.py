@@ -2,11 +2,10 @@ import base64
 import json
 import logging
 import mimetypes
-import os
 import re
 from collections import deque
 from datetime import datetime
-from html import escape, unescape
+from html import escape
 from typing import Any
 from urllib.parse import urlparse
 
@@ -110,23 +109,14 @@ class OneBotMixin:
         return str(self_id) if self_id is not None else ""
 
     @staticmethod
-    def _mention_tag(qq: str) -> str:
-        qq_value = qq.strip()
-        if not qq_value:
+    def _mention_tag(target_id: str, *, mention_type: str = "") -> str:
+        mention_type_value = mention_type.strip().lower()
+        if mention_type_value == "all":
+            return '<at type="all"/>'
+        target_value = target_id.strip()
+        if not target_value:
             return ""
-        return f"[CQ:at,qq={qq_value}]"
-
-    @staticmethod
-    def _parse_cq_params(params_text: str) -> dict[str, str]:
-        out: dict[str, str] = {}
-        if not params_text.strip():
-            return out
-        for piece in params_text.split(","):
-            if "=" not in piece:
-                continue
-            key, value = piece.split("=", 1)
-            out[key.strip()] = unescape(value.strip())
-        return out
+        return f'<at id="{escape(target_value, quote=True)}"/>'
 
     @staticmethod
     def _merge_images(primary: list[MessageImage], secondary: list[MessageImage]) -> list[MessageImage]:
@@ -152,19 +142,11 @@ class OneBotMixin:
             merged.append(key)
         return merged
 
-    @staticmethod
-    def _image_hash_hint(img: MessageImage) -> str:
-        if img.file.strip():
-            return os.path.basename(img.file.strip())
-        if img.url.strip():
-            path = urlparse(img.url.strip()).path
-            base = os.path.basename(path)
-            if base:
-                return base
-        return "unknown"
-
     def _image_tag(self, img: MessageImage) -> str:
-        return f"[图片:{self._image_hash_hint(img)}]"
+        src = img.url.strip() or img.file.strip()
+        if not src:
+            return "<img/>"
+        return f'<img src="{escape(src, quote=True)}"/>'
 
     def _extract_message_from_payload(
         self, payload: Any, self_qq: str
@@ -179,35 +161,55 @@ class OneBotMixin:
             for seg in payload:
                 if not isinstance(seg, dict):
                     continue
-                seg_type = seg.get("type")
-                data = seg.get("data") or {}
+                data_raw = seg.get("data")
+                data = data_raw if isinstance(data_raw, dict) else {}
+                seg_type = str(seg.get("type") or data.get("type") or "").strip().lower()
+
+                def _read(*keys: str) -> str:
+                    for key in keys:
+                        value = seg.get(key)
+                        if value is not None:
+                            return str(value)
+                        value = data.get(key)
+                        if value is not None:
+                            return str(value)
+                    return ""
+
                 if seg_type == "text":
-                    text_parts.append(str(data.get("text", "")))
+                    text_value = _read("text", "content", "value", "name").strip()
+                    if text_value:
+                        text_parts.append(text_value)
                 elif seg_type == "at":
-                    qq = str(data.get("qq", "")).strip()
-                    if self_qq and qq == self_qq:
+                    at_type = str(
+                        data.get("at_type")
+                        or data.get("mention_type")
+                        or data.get("type")
+                        or seg.get("at_type")
+                        or seg.get("mention_type")
+                        or ""
+                    ).strip().lower()
+                    mention_id = _read("id", "qq", "user_id", "userId").strip()
+                    if at_type == "all":
                         mentioned = True
-                    mention_text = self._mention_tag(qq)
+                        text_parts.append(self._mention_tag("", mention_type="all"))
+                        continue
+                    if self_qq and mention_id == self_qq:
+                        mentioned = True
+                    mention_text = self._mention_tag(mention_id)
                     if mention_text:
                         text_parts.append(mention_text)
-                elif seg_type == "image":
-                    url = str(data.get("url", "")).strip()
-                    file = str(data.get("file", "")).strip()
+                elif seg_type in {"img", "image"}:
+                    url = _read("src", "url").strip()
+                    file = _read("file", "path").strip()
                     img = MessageImage(url=url, file=file)
                     images.append(img)
                     text_parts.append(self._image_tag(img))
                 elif seg_type in {"reply", "quote"}:
-                    ref_id = str(data.get("id") or data.get("message_id") or "").strip()
+                    ref_id = _read("id", "message_id", "messageId").strip()
                     if ref_id:
                         reply_ids.append(ref_id)
                 elif seg_type in {"forward", "longmsg"}:
-                    fwd_id = str(
-                        data.get("id")
-                        or data.get("message_id")
-                        or data.get("resid")
-                        or data.get("res_id")
-                        or ""
-                    ).strip()
+                    fwd_id = _read("id", "message_id", "messageId", "resid", "res_id").strip()
                     if fwd_id:
                         forward_ids.append(fwd_id)
             text = re.sub(r"\s+", " ", "".join(text_parts)).strip()
@@ -220,72 +222,14 @@ class OneBotMixin:
             )
 
         if isinstance(payload, str):
-            text_parts: list[str] = []
-            last = 0
-            for matched in re.finditer(r"\[CQ:([a-zA-Z0-9_]+)(?:,([^\]]*))?\]", payload):
-                text_parts.append(payload[last : matched.start()])
-                last = matched.end()
-                cq_type = matched.group(1)
-                params = self._parse_cq_params(matched.group(2) or "")
-                if cq_type == "at":
-                    qq = params.get("qq", "").strip()
-                    if self_qq and qq == self_qq:
-                        mentioned = True
-                    mention_text = self._mention_tag(qq)
-                    if mention_text:
-                        text_parts.append(mention_text)
-                    continue
-                if cq_type == "image":
-                    img = MessageImage(
-                        url=params.get("url", "").strip(),
-                        file=params.get("file", "").strip(),
-                    )
-                    images.append(img)
-                    text_parts.append(self._image_tag(img))
-                    continue
-                if cq_type in {"reply", "quote"}:
-                    ref_id = str(params.get("id", "")).strip()
-                    if ref_id:
-                        reply_ids.append(ref_id)
-                    continue
-                if cq_type in {"forward", "longmsg"}:
-                    fwd_id = str(
-                        params.get("id")
-                        or params.get("message_id")
-                        or params.get("resid")
-                        or params.get("res_id")
-                        or ""
-                    ).strip()
-                    if fwd_id:
-                        forward_ids.append(fwd_id)
-                    continue
-            text_parts.append(payload[last:])
-            merged = "".join(text_parts)
+            parser = getattr(self, "_satori_content_to_segments", None)
+            if callable(parser):
+                parsed_segments = parser(payload)
+                if isinstance(parsed_segments, list) and parsed_segments:
+                    return self._extract_message_from_payload(parsed_segments, self_qq)
 
-            # llonebot 部分场景会把图片渲染成 [图片]filename.ext
-            for img_name in re.findall(
-                r"\[图片\]\s*([A-Za-z0-9._-]+\.(?:png|jpg|jpeg|gif|webp|bmp))",
-                merged,
-                flags=re.IGNORECASE,
-            ):
-                images.append(MessageImage(url="", file=img_name.strip()))
-
-            # 统一把 [图片]xxx.png 规范成 [图片:xxx.png]
-            merged = re.sub(
-                r"\[图片\]\s*([A-Za-z0-9._-]+\.(?:png|jpg|jpeg|gif|webp|bmp))",
-                r"[图片:\1]",
-                merged,
-                flags=re.IGNORECASE,
-            )
-
-            text = re.sub(r"\s+", " ", merged).strip()
-            return ParsedMessage(
-                text=text,
-                mentioned=mentioned,
-                images=images,
-                reply_ids=reply_ids,
-                forward_ids=forward_ids,
-            )
+            text = re.sub(r"\s+", " ", payload).strip()
+            return ParsedMessage(text=text, mentioned=False, images=[], reply_ids=[], forward_ids=[])
 
         return ParsedMessage(text="", mentioned=False, images=[], reply_ids=[], forward_ids=[])
 
@@ -427,7 +371,7 @@ class OneBotMixin:
 
     @staticmethod
     def _strip_leading_plain_mention(text: str) -> tuple[str, bool]:
-        # Some clients send plain text like "@机器人 /new" instead of CQ at segment.
+        # Some clients send plain text like "@机器人 /new" instead of structured mention segments.
         matched = re.match(r"^\s*@[^ \t\r\n]+\s*", text)
         if not matched:
             return text, False
@@ -438,9 +382,13 @@ class OneBotMixin:
         raw = (arg or "").strip()
         if re.fullmatch(r"\d{5,20}", raw):
             return raw
-        cq_match = re.fullmatch(r"\[cq:at,[^\]]*qq=(\d{5,20})[^\]]*\]", raw, flags=re.IGNORECASE)
-        if cq_match:
-            return cq_match.group(1)
+        at_match = re.fullmatch(
+            r"<at\b[^>]*\bid\s*=\s*(?:\"|')?(\d{5,20})(?:\"|')?[^>]*\/?>",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if at_match:
+            return at_match.group(1)
         return ""
 
     @staticmethod
@@ -464,7 +412,7 @@ class OneBotMixin:
         stripped = (text or "").strip()
         while True:
             next_value = re.sub(
-                r"^\s*\[CQ:at,qq=[^\]]+\]\s*",
+                r"^\s*<at\b[^>]*?/>\s*",
                 "",
                 stripped,
                 count=1,
@@ -605,14 +553,14 @@ class OneBotMixin:
         route = self._satori_route_from_event(event)
         if route is None:
             raise RuntimeError("Missing Satori route in reply event")
-        outgoing = self._normalize_outgoing_mentions(text)
+        outgoing = (text or "").strip()
         if (
             event.get("message_type") == "group"
             and self.cfg.group_reply_at_sender
             and event.get("user_id") is not None
         ):
             uid = str(event.get("user_id") or "").strip()
-            if uid and f'<at id="{uid}"/>' not in outgoing:
+            if uid and not self._contains_satori_at_user(outgoing, uid):
                 outgoing = f'<at id="{uid}"/> {outgoing}'
         payload = {
             "channel_id": route["channel_id"],
@@ -623,52 +571,15 @@ class OneBotMixin:
             raise RuntimeError("Satori message.create failed")
 
     @staticmethod
-    def _contains_cq_at(text: str) -> bool:
-        return bool(re.search(r"\[CQ:at,qq=[^\]]+\]", text, flags=re.IGNORECASE))
-
-    @staticmethod
-    def _contains_cq_at_user(text: str, user_id: str) -> bool:
-        qq = user_id.strip()
-        if not qq:
+    def _contains_satori_at_user(text: str, user_id: str) -> bool:
+        uid = user_id.strip()
+        if not uid:
             return False
-        pattern = rf"\[CQ:at,qq={re.escape(qq)}\]"
-        return bool(re.search(pattern, text, flags=re.IGNORECASE))
-
-    @staticmethod
-    def _normalize_outgoing_mentions(text: str) -> str:
-        normalized = text or ""
         pattern = re.compile(
-            r"\[CQ:at,qq=([^\],]+)(?:,[^\]]*)?\]|\[@(?:qq=)?([0-9]+)\]|\[@all\]|(<at\s+[^>]*?/?>)",
+            rf"<at\b[^>]*\bid\s*=\s*(?:\"|')?{re.escape(uid)}(?:\"|')?[^>]*\/?>",
             flags=re.IGNORECASE,
         )
-        out: list[str] = []
-        last = 0
-        for matched in pattern.finditer(normalized):
-            plain = normalized[last : matched.start()]
-            if plain:
-                out.append(escape(plain))
-            if matched.group(3):
-                out.append(matched.group(3))
-                last = matched.end()
-                continue
-            token = matched.group(0).lower()
-            qq = (matched.group(1) or matched.group(2) or "").strip()
-            if token == "[@all]" or qq.lower() == "all":
-                out.append('<at type="all"/>')
-            elif qq:
-                out.append(f'<at id="{escape(qq)}"/>')
-            last = matched.end()
-        tail = normalized[last:]
-        if tail:
-            out.append(escape(tail))
-        return "".join(out)
-
-    async def _onebot_action(
-        self, action: str, payload: dict[str, Any], timeout_sec: float | None = None
-    ) -> dict[str, Any] | None:
-        # 保留旧方法名，便于核心代码复用；Satori 下不再提供 OneBot 扩展查询能力。
-        _ = (action, payload, timeout_sec)
-        return None
+        return bool(pattern.search(text or ""))
 
     async def _mark_processing_emoji(self, event: dict[str, Any]) -> dict[str, Any] | None:
         now = datetime.now().timestamp()
@@ -838,24 +749,6 @@ class OneBotMixin:
         if remaining > 0:
             lines.append(f"- 其余 {remaining} 条转发节点已省略")
         return "\n".join(lines), out_images
-
-    async def _onebot_get_forward_msg(self, forward_id: str) -> dict[str, Any] | None:
-        candidates = [
-            {"message_id": forward_id},
-            {"id": forward_id},
-            {"resid": forward_id},
-            {"res_id": forward_id},
-        ]
-        best: dict[str, Any] | None = None
-        for payload in candidates:
-            data = await self._onebot_action("get_forward_msg", payload, timeout_sec=10)
-            if data is None:
-                continue
-            best = data
-            messages = data.get("messages")
-            if isinstance(messages, list) and messages:
-                return data
-        return best
 
     async def _augment_parsed_message(self, event: dict[str, Any], parsed: ParsedMessage) -> ParsedMessage:
         route = self._satori_route_from_event(event)
@@ -1122,33 +1015,6 @@ class OneBotMixin:
         )
         return block, images
 
-    async def _resolve_image_with_get_image(self, file_id: str) -> MessageImage | None:
-        # OneBot v11: /get_image(file) -> { file, url, file_name, ... }
-        data = await self._onebot_get_image_info(file_id)
-        if data:
-            url = str(data.get("url", "")).strip()
-            file_name = str(data.get("file_name", "") or data.get("filename", "")).strip()
-            local_file = str(data.get("file", "")).strip()
-            merged_file = file_name or file_id or local_file
-            return MessageImage(url=url, file=merged_file)
-
-        return None
-
-    async def _onebot_get_image_info(self, file_id: str) -> dict[str, Any] | None:
-        candidates = [file_id]
-        if file_id:
-            lower = file_id.lower()
-            upper = file_id.upper()
-            if lower not in candidates:
-                candidates.append(lower)
-            if upper not in candidates:
-                candidates.append(upper)
-        for cand in candidates:
-            data = await self._onebot_action("get_image", {"file": cand}, timeout_sec=8)
-            if data:
-                return data
-        return None
-
     async def _download_image(self, url: str) -> tuple[bytes | None, str]:
         assert self.session is not None
         satori_host = urlparse(self.cfg.satori_http_base).netloc
@@ -1189,39 +1055,24 @@ class OneBotMixin:
         for img in images:
             if len(out) >= max_count:
                 break
-            resolved = img
-            if resolved.file.strip():
-                # 优先使用 get_image 刷新 URL，避免旧 URL 失效。
-                got = await self._resolve_image_with_get_image(resolved.file.strip())
-                if got is not None:
-                    resolved = got
-            elif not resolved.url.strip():
+            url = img.url.strip()
+            if not url:
+                logging.warning("Skip image without url (file=%s)", img.file)
                 continue
-
-            url = resolved.url.strip()
             if not (url.startswith("http://") or url.startswith("https://")):
-                logging.warning(
-                    "Skip image without downloadable url (file=%s)", resolved.file or img.file
-                )
+                logging.warning("Skip image without downloadable url (file=%s)", img.file)
                 continue
 
             try:
                 content, ctype = await self._download_image(url)
-                if (not content) and resolved.file.strip():
-                    # URL 可能过期，再刷新一次并重试。
-                    refreshed = await self._resolve_image_with_get_image(resolved.file.strip())
-                    if refreshed and refreshed.url.strip() and refreshed.url.strip() != url:
-                        resolved = refreshed
-                        content, ctype = await self._download_image(resolved.url.strip())
-
                 if not content:
-                    logging.warning("Skip image download failed (file=%s url=%s)", resolved.file, url)
+                    logging.warning("Skip image download failed (file=%s url=%s)", img.file, url)
                     continue
                 if len(content) > max_bytes:
                     logging.warning("Skip image too large (%s bytes): %s", len(content), url)
                     continue
 
-                mime_type = self._guess_image_mime(resolved.url.strip(), resolved.file, ctype)
+                mime_type = self._guess_image_mime(url, img.file, ctype)
                 out.append(
                     {
                         "type": "image",

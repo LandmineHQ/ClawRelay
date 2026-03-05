@@ -4,6 +4,7 @@ import logging
 import time
 import uuid
 from collections import defaultdict, deque
+from html import escape
 from typing import Any, cast
 
 import aiohttp
@@ -87,8 +88,9 @@ class OpenClawGatewayMixin:
                     or item.get("id")
                 )
                 if mention_id is not None:
-                    mention_text = f"[@{str(mention_id).strip()}]"
-                    if mention_text != "[@]":
+                    mention_value = str(mention_id).strip()
+                    if mention_value:
+                        mention_text = f'<at id="{escape(mention_value, quote=True)}"/>'
                         chunks.append(mention_text)
                         continue
 
