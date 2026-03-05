@@ -757,6 +757,186 @@ class OneBotMixin:
             lines.append(f"- 其余 {remaining} 条转发节点已省略")
         return "\n".join(lines), out_images
 
+    def _onebot_payload_to_satori_content(self, payload: Any) -> str:
+        if isinstance(payload, str):
+            text = payload.strip()
+            if not text:
+                return ""
+            return escape(text)
+        if isinstance(payload, list):
+            out: list[str] = []
+            for seg in payload:
+                rendered = self._onebot_segment_to_satori_element(seg)
+                if rendered:
+                    out.append(rendered)
+            return "".join(out)
+        if isinstance(payload, dict):
+            # OneBot-like segment object.
+            if "type" in payload or "data" in payload:
+                return self._onebot_segment_to_satori_element(payload)
+            # Wrapper-like payload.
+            for key in ("content", "message"):
+                if key in payload:
+                    return self._onebot_payload_to_satori_content(payload.get(key))
+            for key in ("text", "value", "name"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return escape(value.strip())
+        return ""
+
+    def _onebot_segment_to_satori_element(self, seg: Any) -> str:
+        if not isinstance(seg, dict):
+            return escape(str(seg))
+        data_raw = seg.get("data")
+        data = data_raw if isinstance(data_raw, dict) else {}
+        seg_type = str(seg.get("type") or data.get("type") or "").strip().lower()
+
+        def _read(*keys: str) -> str:
+            for key in keys:
+                value = seg.get(key)
+                if value is not None:
+                    return str(value)
+                value = data.get(key)
+                if value is not None:
+                    return str(value)
+            return ""
+
+        if seg_type == "text":
+            return escape(_read("text", "content", "value", "name"))
+        if seg_type == "at":
+            mention_type = _read("at_type", "mention_type").strip().lower()
+            target = _read("id", "qq", "user_id", "userId").strip()
+            if mention_type in {"all", "here"}:
+                return f'<at type="{escape(mention_type, quote=True)}"/>'
+            if target.lower() == "all":
+                return '<at type="all"/>'
+            if target:
+                return f'<at id="{escape(target, quote=True)}"/>'
+            return ""
+        if seg_type in {"img", "image"}:
+            src = _read("src", "url", "file", "path").strip()
+            if src:
+                return f'<img src="{escape(src, quote=True)}"/>'
+            return "<img/>"
+        if seg_type in {"reply", "quote"}:
+            msg_id = _read("id", "message_id", "messageId").strip()
+            if msg_id:
+                return f'<quote id="{escape(msg_id, quote=True)}"/>'
+            return "<quote/>"
+        if seg_type in {"forward", "longmsg"}:
+            msg_id = _read("id", "message_id", "messageId", "resid", "res_id").strip()
+            if msg_id:
+                return f'<message id="{escape(msg_id, quote=True)}" forward/>'
+            return "<message forward/>"
+        fallback_text = _read("text", "content", "value", "name")
+        if fallback_text:
+            return escape(fallback_text)
+        return ""
+
+    def _build_satori_forward_message_from_internal(
+        self,
+        forward_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        messages_raw = payload.get("messages")
+        messages = messages_raw if isinstance(messages_raw, list) else []
+        if not messages:
+            return None
+
+        parts: list[str] = ["<message forward>"]
+        node_count = 0
+        max_nodes = 30
+        for raw_node in messages[:max_nodes]:
+            if not isinstance(raw_node, dict):
+                continue
+            node_count += 1
+            sender_raw = raw_node.get("sender")
+            sender = sender_raw if isinstance(sender_raw, dict) else {}
+            author_id = str(
+                sender.get("user_id") or sender.get("id") or sender.get("qq") or ""
+            ).strip()
+            author_name = str(
+                sender.get("nickname") or sender.get("card") or sender.get("name") or ""
+            ).strip()
+            author_avatar = str(sender.get("avatar") or "").strip()
+
+            content_payload = raw_node.get("content")
+            if content_payload is None:
+                content_payload = raw_node.get("message")
+            rendered = self._onebot_payload_to_satori_content(content_payload)
+            node_msg_id = str(raw_node.get("message_id") or raw_node.get("id") or "").strip()
+
+            if not rendered:
+                if node_msg_id:
+                    parts.append(f'<message id="{escape(node_msg_id, quote=True)}"/>')
+                continue
+
+            parts.append("<message>")
+            if author_id or author_name or author_avatar:
+                attrs: list[str] = []
+                if author_id:
+                    attrs.append(f'id="{escape(author_id, quote=True)}"')
+                if author_name:
+                    attrs.append(f'name="{escape(author_name, quote=True)}"')
+                if author_avatar:
+                    attrs.append(f'avatar="{escape(author_avatar, quote=True)}"')
+                parts.append(f"<author {' '.join(attrs)}/>")
+            parts.append(rendered)
+            parts.append("</message>")
+
+        if node_count <= 0:
+            return None
+        remaining = len(messages) - min(len(messages), max_nodes)
+        if remaining > 0:
+            parts.append(f"<message>{escape(f'其余 {remaining} 条转发节点已省略')}</message>")
+        parts.append("</message>")
+        content = "".join(parts)
+        return {
+            "id": forward_id,
+            "message_id": forward_id,
+            "content": content,
+            "user": {
+                "id": "forward",
+                "name": "合并转发",
+            },
+        }
+
+    async def _satori_message_get_with_forward_fallback(
+        self,
+        route: dict[str, str],
+        message_id: str,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        payload = {
+            "channel_id": route["channel_id"],
+            "message_id": message_id,
+        }
+        data = await self._satori_action("message.get", payload, route, timeout_sec=8)
+        if isinstance(data, dict):
+            return data, False
+
+        internal_raw = await self._satori_action(
+            "internal/onebot11/get_forward_msg",
+            {"message_id": message_id},
+            route,
+            timeout_sec=10,
+        )
+        if not isinstance(internal_raw, dict):
+            return None, False
+
+        payload_candidates: list[dict[str, Any]] = []
+        data_raw = internal_raw.get("data")
+        if isinstance(data_raw, dict):
+            payload_candidates.append(data_raw)
+        payload_candidates.append(internal_raw)
+        for candidate in payload_candidates:
+            msg_raw = candidate.get("messages")
+            if not isinstance(msg_raw, list) or not msg_raw:
+                continue
+            synthesized = self._build_satori_forward_message_from_internal(message_id, candidate)
+            if isinstance(synthesized, dict):
+                return synthesized, True
+        return None, False
+
     async def _augment_parsed_message(self, event: dict[str, Any], parsed: ParsedMessage) -> ParsedMessage:
         route = self._satori_route_from_event(event)
         if route is None:
@@ -772,11 +952,9 @@ class OneBotMixin:
 
         # 引用消息：按 message_id 拉取并结构化到上下文中。
         for reply_id in parsed.reply_ids[:2]:
-            payload = {
-                "channel_id": route["channel_id"],
-                "message_id": reply_id,
-            }
-            data = await self._satori_action("message.get", payload, route, timeout_sec=8)
+            data, used_internal_fallback = await self._satori_message_get_with_forward_fallback(
+                route, reply_id
+            )
             if not isinstance(data, dict):
                 if history_index is None:
                     history_index = await self._satori_history_message_index(route, limit=200)
@@ -810,18 +988,20 @@ class OneBotMixin:
                 reply_blocks.append("[引用消息]\n" f"- message_id: {reply_id}\n" f"- status: {status}")
                 continue
             block, images = self._build_satori_message_context_block("引用消息", reply_id, data, self_qq)
+            if used_internal_fallback:
+                block = block + "\n- status: message.get 失败，使用 internal/onebot11/get_forward_msg 回退"
             reply_blocks.append(block)
             merged_images = self._merge_images(merged_images, images)
 
         # 转发消息：优先按 id 尝试 message.get；若平台不支持则至少保留结构化 id。
         for forward_id in parsed.forward_ids[:2]:
-            payload = {
-                "channel_id": route["channel_id"],
-                "message_id": forward_id,
-            }
-            data = await self._satori_action("message.get", payload, route, timeout_sec=8)
+            data, used_internal_fallback = await self._satori_message_get_with_forward_fallback(
+                route, forward_id
+            )
             if isinstance(data, dict):
                 block, images = self._build_satori_message_context_block("转发消息", forward_id, data, self_qq)
+                if used_internal_fallback:
+                    block = block + "\n- status: message.get 失败，使用 internal/onebot11/get_forward_msg 回退"
                 forward_blocks.append(block)
                 merged_images = self._merge_images(merged_images, images)
                 continue
@@ -863,9 +1043,9 @@ class OneBotMixin:
         text_out = parsed.text
         if not text_out.strip():
             if parsed.reply_ids:
-                text_out = f"[引用消息:{parsed.reply_ids[0]}]"
+                text_out = f'<quote id="{escape(parsed.reply_ids[0], quote=True)}"/>'
             elif parsed.forward_ids:
-                text_out = f"[转发消息:{parsed.forward_ids[0]}]"
+                text_out = f'<message id="{escape(parsed.forward_ids[0], quote=True)}" forward/>'
 
         return ParsedMessage(
             text=text_out,
