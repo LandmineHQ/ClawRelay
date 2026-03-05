@@ -6,7 +6,7 @@ import os
 import re
 from collections import deque
 from datetime import datetime
-from html import unescape
+from html import escape, unescape
 from typing import Any
 from urllib.parse import urlparse
 
@@ -17,8 +17,7 @@ from bridge_models import MessageImage, ParsedMessage, PendingObservation
 
 
 class OneBotMixin:
-    # 腾讯文档 EmojiType: 30 = 奋斗
-    _PROCESSING_EMOJI_ID = 30
+    _PROCESSING_EMOJI = "奋斗"
 
     cfg: Config
     session: aiohttp.ClientSession | None
@@ -30,9 +29,69 @@ class OneBotMixin:
 
     def _onebot_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
-        if self.cfg.onebot_access_token:
-            headers["Authorization"] = f"Bearer {self.cfg.onebot_access_token}"
+        token = self.cfg.satori_token.strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         return headers
+
+    def _satori_api_base(self) -> str:
+        base = self.cfg.satori_http_base.strip().rstrip("/")
+        if not base.endswith("/v1"):
+            base = f"{base}/v1"
+        return base
+
+    def _satori_route_from_event(self, event: dict[str, Any]) -> dict[str, str] | None:
+        raw = event.get("_satori_route")
+        if isinstance(raw, dict):
+            channel_id = str(raw.get("channel_id") or "").strip()
+            platform = str(raw.get("platform") or self.cfg.satori_platform or "").strip()
+            self_id = str(raw.get("self_id") or self.cfg.satori_self_id or "").strip()
+            if channel_id and platform and self_id:
+                return {
+                    "channel_id": channel_id,
+                    "platform": platform,
+                    "self_id": self_id,
+                }
+        return None
+
+    async def _satori_action(
+        self,
+        action: str,
+        payload: dict[str, Any],
+        route: dict[str, str] | None,
+        timeout_sec: float | None = None,
+    ) -> dict[str, Any] | None:
+        assert self.session is not None
+        if route is None:
+            logging.warning("Satori action %s missing route", action)
+            return None
+        headers = self._onebot_headers()
+        headers["Satori-Platform"] = route["platform"]
+        headers["Satori-User-ID"] = route["self_id"]
+        url = f"{self._satori_api_base()}/{action}"
+        try:
+            async with self.session.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=timeout_sec) if timeout_sec else None,
+            ) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    logging.warning("Satori action %s HTTP %s: %s", action, resp.status, text[:200])
+                    return None
+                if not text.strip():
+                    return {}
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError:
+                    return {}
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Satori action %s failed: %s", action, exc)
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+        return {}
 
     def _build_session_key(self, event: dict[str, Any]) -> str:
         if event.get("message_type") == "private":
@@ -453,7 +512,7 @@ class OneBotMixin:
         rule_block = (
             "规则：\n"
             "1) user_name 可能包含数字（例如“我是1354987”），这不是 QQ 号。\n"
-            "2) 只能使用 user_id 作为 QQ 号；如需@，仅可输出 `[CQ:at,qq=<user_id>]`。\n"
+            "2) 只能使用 user_id 作为 QQ 号；如需@，仅可输出 `<at id=\"<user_id>\"/>`。\n"
             "3) 默认@发送者，除非被要求不@发送者。\n"
             f"4) 当前待回复消息发送者 user_id: {current_sender_id}\n"
             "5) 默认使用简洁纯文本回复；仅当用户明确要求 Markdown 时，才使用 Markdown。"
@@ -516,43 +575,25 @@ class OneBotMixin:
     async def _send_onebot_reply(self, event: dict[str, Any], text: str) -> None:
         assert self.session is not None
 
-        message_type = event.get("message_type")
-        endpoint: str
-        payload: dict[str, Any]
-        if message_type == "private":
-            endpoint = "send_private_msg"
-            payload = {"user_id": event.get("user_id"), "message": text, "auto_escape": False}
-        else:
-            endpoint = "send_group_msg"
-            group_text = self._normalize_outgoing_mentions(text)
-            if (
-                self.cfg.group_reply_at_sender
-                and event.get("user_id") is not None
-                and not self._contains_cq_at_user(group_text, str(event["user_id"]))
-            ):
-                group_text = f"[CQ:at,qq={event['user_id']}] {group_text}"
-            payload = {"group_id": event.get("group_id"), "message": group_text, "auto_escape": False}
-
-        url = f"{self.cfg.onebot_http_base.rstrip('/')}/{endpoint}"
-        async with self.session.post(
-            url,
-            headers=self._onebot_headers(),
-            json=payload,
-        ) as resp:
-            body = await resp.text()
-            if resp.status >= 400:
-                raise RuntimeError(f"OneBot HTTP {resp.status}: {body[:500]}")
-            try:
-                parsed = json.loads(body)
-            except json.JSONDecodeError:
-                logging.warning("OneBot non-JSON response: %s", body[:200])
-                return
-            if not isinstance(parsed, dict):
-                logging.warning("OneBot non-object response: %s", body[:200])
-                return
-            data = parsed
-            if data.get("status") != "ok" and data.get("retcode") not in (0, None):
-                raise RuntimeError(f"OneBot send failed: {data}")
+        route = self._satori_route_from_event(event)
+        if route is None:
+            raise RuntimeError("Missing Satori route in reply event")
+        outgoing = self._normalize_outgoing_mentions(text)
+        if (
+            event.get("message_type") == "group"
+            and self.cfg.group_reply_at_sender
+            and event.get("user_id") is not None
+        ):
+            uid = str(event.get("user_id") or "").strip()
+            if uid and f'<at id="{uid}"/>' not in outgoing:
+                outgoing = f'<at id="{uid}"/> {outgoing}'
+        payload = {
+            "channel_id": route["channel_id"],
+            "content": outgoing,
+        }
+        result = await self._satori_action("message.create", payload, route, timeout_sec=12)
+        if result is None:
+            raise RuntimeError("Satori message.create failed")
 
     @staticmethod
     def _contains_cq_at(text: str) -> bool:
@@ -568,76 +609,55 @@ class OneBotMixin:
 
     @staticmethod
     def _normalize_outgoing_mentions(text: str) -> str:
-        # Allow model to use lightweight mention form like [@123456] / [@qq=123456].
-        out = re.sub(r"\[@(?:qq=)?(\d+)\]", r"[CQ:at,qq=\1]", text, flags=re.IGNORECASE)
-        out = re.sub(r"\[@all\]", "[CQ:at,qq=all]", out, flags=re.IGNORECASE)
-        return out
+        normalized = text or ""
+        pattern = re.compile(
+            r"\[CQ:at,qq=([^\],]+)(?:,[^\]]*)?\]|\[@(?:qq=)?([0-9]+)\]|\[@all\]|(<at\s+[^>]*?/?>)",
+            flags=re.IGNORECASE,
+        )
+        out: list[str] = []
+        last = 0
+        for matched in pattern.finditer(normalized):
+            plain = normalized[last : matched.start()]
+            if plain:
+                out.append(escape(plain))
+            if matched.group(3):
+                out.append(matched.group(3))
+                last = matched.end()
+                continue
+            token = matched.group(0).lower()
+            qq = (matched.group(1) or matched.group(2) or "").strip()
+            if token == "[@all]" or qq.lower() == "all":
+                out.append('<at type="all"/>')
+            elif qq:
+                out.append(f'<at id="{escape(qq)}"/>')
+            last = matched.end()
+        tail = normalized[last:]
+        if tail:
+            out.append(escape(tail))
+        return "".join(out)
 
     async def _onebot_action(
         self, action: str, payload: dict[str, Any], timeout_sec: float | None = None
     ) -> dict[str, Any] | None:
-        assert self.session is not None
-        url = f"{self.cfg.onebot_http_base.rstrip('/')}/{action}"
-        try:
-            async with self.session.post(
-                url,
-                headers=self._onebot_headers(),
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=timeout_sec) if timeout_sec else None,
-            ) as resp:
-                text = await resp.text()
-                if resp.status >= 400:
-                    logging.warning("OneBot action %s HTTP %s: %s", action, resp.status, text[:200])
-                    return None
-                parsed = json.loads(text)
-        except Exception as exc:  # noqa: BLE001
-            logging.warning("OneBot action %s failed: %s", action, exc)
-            return None
-
-        if not isinstance(parsed, dict):
-            logging.warning("OneBot action %s non-object response: %s", action, text[:200])
-            return None
-        data = parsed
-        if data.get("status") != "ok" and data.get("retcode") not in (0, None):
-            if self._is_onebot_idempotent_success(action, data):
-                logging.info(
-                    "OneBot action %s treated as idempotent success: retcode=%s message=%s",
-                    action,
-                    data.get("retcode"),
-                    str(data.get("wording") or data.get("message") or "").strip(),
-                )
-                return {}
-            logging.warning("OneBot action %s retcode failed: %s", action, data)
-            return None
-        result = data.get("data")
-        return result if isinstance(result, dict) else {}
-
-    @staticmethod
-    def _is_onebot_idempotent_success(action: str, data: dict[str, Any]) -> bool:
-        if action != "set_msg_emoji_like":
-            return False
-        retcode = data.get("retcode")
-        if retcode not in (200, "200"):
-            return False
-        msg = str(data.get("wording") or data.get("message") or "").strip()
-        normalized = re.sub(r"\s+", "", msg)
-        return "已经设置过该表情" in normalized or "已设置过该表情" in normalized
+        # 保留旧方法名，便于核心代码复用；Satori 下不再提供 OneBot 扩展查询能力。
+        _ = (action, payload, timeout_sec)
+        return None
 
     async def _mark_processing_emoji(self, event: dict[str, Any]) -> dict[str, Any] | None:
         marker = self._processing_marker_from_event(event)
         if marker is None:
             return None
         payload = {
+            "channel_id": marker["route"]["channel_id"],
             "message_id": marker["message_id"],
-            "emoji_id": marker["emoji_id"],
-            "set": True,
+            "emoji": marker["emoji"],
         }
-        result = await self._onebot_action("set_msg_emoji_like", payload, timeout_sec=8)
+        result = await self._satori_action("reaction.create", payload, marker["route"], timeout_sec=8)
         if result is None:
             logging.warning(
-                "Failed to set processing emoji: message_id=%s emoji_id=%s",
+                "Failed to set processing emoji: message_id=%s emoji=%s",
                 marker.get("message_id"),
-                marker.get("emoji_id"),
+                marker.get("emoji"),
             )
             return None
         return marker
@@ -646,19 +666,19 @@ class OneBotMixin:
         if marker is None:
             return
         message_id = marker.get("message_id")
-        emoji_id = marker.get("emoji_id")
-        if message_id is None or emoji_id is None:
+        emoji = marker.get("emoji")
+        route = marker.get("route")
+        if message_id is None or emoji is None or not isinstance(route, dict):
             return
-        marker_key = f"{message_id}:{emoji_id}"
+        marker_key = f"{message_id}:{emoji}"
         if marker_key in self.cleared_processing_marker_set:
             return
-        # 按 OneBot 扩展接口规范，仅使用 set_msg_emoji_like(set=false) 取消贴表情。
         payload = {
+            "channel_id": route.get("channel_id"),
             "message_id": message_id,
-            "emoji_id": emoji_id,
-            "set": False,
+            "emoji": emoji,
         }
-        result = await self._onebot_action("set_msg_emoji_like", payload, timeout_sec=8)
+        result = await self._satori_action("reaction.delete", payload, route, timeout_sec=8)
         if result is not None:
             self.cleared_processing_marker_set.add(marker_key)
             self.cleared_processing_markers.append(marker_key)
@@ -669,9 +689,9 @@ class OneBotMixin:
                     self.cleared_processing_marker_set.discard(old)
             return
         logging.warning(
-            "Failed to clear processing emoji: message_id=%s emoji_id=%s",
+            "Failed to clear processing emoji: message_id=%s emoji=%s",
             message_id,
-            emoji_id,
+            emoji,
         )
         # 部分实现在重复状态下会返回 failed，但视觉结果可能已生效，这里仍做去重以免重复刷接口。
         self.cleared_processing_marker_set.add(marker_key)
@@ -688,9 +708,13 @@ class OneBotMixin:
         message_id = event.get("message_id")
         if message_id is None:
             return None
+        route = self._satori_route_from_event(event)
+        if route is None:
+            return None
         return {
             "message_id": message_id,
-            "emoji_id": self._PROCESSING_EMOJI_ID,
+            "emoji": self.cfg.satori_processing_emoji or self._PROCESSING_EMOJI,
+            "route": route,
         }
 
     @staticmethod
@@ -797,77 +821,9 @@ class OneBotMixin:
         return best
 
     async def _augment_parsed_message(self, event: dict[str, Any], parsed: ParsedMessage) -> ParsedMessage:
-        if self.session is None:
-            return parsed
-        self_qq = self._get_self_qq(event)
-        text = parsed.text
-        images = list(parsed.images)
-        mentioned = parsed.mentioned
-        reply_ids = list(parsed.reply_ids)
-        forward_ids = list(parsed.forward_ids)
-        context_blocks: list[str] = []
-
-        # 当 message 只呈现为 “[图片]xxx.png” 时，补查 get_msg 还原标准消息段。
-        message_id = event.get("message_id")
-        needs_get_msg = (
-            message_id is not None
-            and (
-                (not parsed.images)
-                or any((not img.url and img.file) for img in parsed.images)
-            )
-        )
-        if needs_get_msg:
-            extra = await self._onebot_action("get_msg", {"message_id": message_id})
-            if extra:
-                parsed_extra = self._parse_message_record_payload(extra, self_qq)
-                images = self._merge_images(images, parsed_extra.images)
-                if not text:
-                    text = parsed_extra.text
-                mentioned = mentioned or parsed_extra.mentioned
-                reply_ids = self._merge_str_list(reply_ids, parsed_extra.reply_ids)
-                forward_ids = self._merge_str_list(forward_ids, parsed_extra.forward_ids)
-
-        # 兼容部分实现把“被引用消息”直接放在事件字段 reply 里。
-        event_reply_raw = event.get("reply")
-        event_reply = event_reply_raw if isinstance(event_reply_raw, dict) else None
-        if event_reply is not None:
-            reply_block, reply_images = self._build_reply_context_block(event_reply, self_qq)
-            context_blocks.append(reply_block)
-            images = self._merge_images(images, reply_images)
-            event_reply_id = str(
-                event_reply.get("message_id") or event_reply.get("id") or event_reply.get("msg_id") or ""
-            ).strip()
-            if event_reply_id:
-                reply_ids = [rid for rid in reply_ids if rid != event_reply_id]
-
-        for reply_id in reply_ids:
-            extra = await self._onebot_action("get_msg", {"message_id": reply_id}, timeout_sec=10)
-            if not extra:
-                continue
-            reply_block, reply_images = self._build_reply_context_block(extra, self_qq)
-            context_blocks.append(reply_block)
-            images = self._merge_images(images, reply_images)
-
-        for forward_id in forward_ids:
-            payload = await self._onebot_get_forward_msg(forward_id)
-            if not payload:
-                continue
-            forward_block, forward_images = self._build_forward_context_block(forward_id, payload, self_qq)
-            context_blocks.append(forward_block)
-            images = self._merge_images(images, forward_images)
-
-        merged_text = self._compact_text(text)
-        if context_blocks:
-            context_text = "\n\n".join(context_blocks)
-            merged_text = f"{merged_text}\n\n{context_text}".strip() if merged_text else context_text
-
-        return ParsedMessage(
-            text=merged_text,
-            mentioned=mentioned,
-            images=images,
-            reply_ids=reply_ids,
-            forward_ids=forward_ids,
-        )
+        _ = event
+        # Satori 协议下不依赖 OneBot 的 get_msg/get_forward_msg 补查，直接使用事件原始内容。
+        return parsed
 
     async def _resolve_image_with_get_image(self, file_id: str) -> MessageImage | None:
         # OneBot v11: /get_image(file) -> { file, url, file_name, ... }
@@ -898,10 +854,11 @@ class OneBotMixin:
 
     async def _download_image(self, url: str) -> tuple[bytes | None, str]:
         assert self.session is not None
-        onebot_host = urlparse(self.cfg.onebot_http_base).netloc
+        satori_host = urlparse(self.cfg.satori_http_base).netloc
         headers: dict[str, str] = {"User-Agent": "Mozilla/5.0"}
-        if onebot_host and urlparse(url).netloc == onebot_host and self.cfg.onebot_access_token:
-            headers["Authorization"] = f"Bearer {self.cfg.onebot_access_token}"
+        token = self.cfg.satori_token.strip()
+        if satori_host and urlparse(url).netloc == satori_host and token:
+            headers["Authorization"] = f"Bearer {token}"
 
         try:
             async with self.session.get(url, headers=headers) as resp:

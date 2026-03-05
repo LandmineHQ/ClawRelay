@@ -1,18 +1,18 @@
 # llonebot <-> OpenClaw Bridge
 
-这个脚本把 `llonebot11 (OneBot v11)` 和 `OpenClaw Gateway (WebSocket RPC)` 连起来，实现 QQ 对话走 OpenClaw。
+这个脚本把 `Satori` 和 `OpenClaw Gateway (WebSocket RPC)` 连起来，实现 QQ 对话走 OpenClaw。
 
 默认配置按你的当前环境写好：
 
-- `llonebot HTTP`: `http://127.0.0.1:3000`
-- `llonebot WS`: `ws://127.0.0.1:3001`
+- `Satori HTTP`: `http://127.0.0.1:5600`
+- `Satori WS`: `ws://127.0.0.1:5600/v1/events`
 - `OpenClaw Gateway WS`: `ws://127.0.0.1:18789`
 
 ## 代码结构
 
 - `bridge_openclaw_llonebot.py`：启动入口（`main/cli`）
 - `bridge_core.py`：桥接主流程编排（收消息、触发命令、上下文冲刷、调用两侧模块）
-- `bridge_onebot_mixin.py`：OneBot v11 解析与 HTTP 调用、图片下载与附件构建
+- `bridge_onebot_mixin.py`：Satori 事件适配、Satori API 调用、图片下载与附件构建
 - `bridge_openclaw_mixin.py`：OpenClaw Gateway 连接、请求、模型能力探测
 - `bridge_config.py`：配置与环境变量解析
 - `bridge_models.py`：共享数据结构（消息、图片、上下文观测）
@@ -31,9 +31,12 @@ uv run start
 
 ## 3. 可选环境变量
 
-- `ONEBOT_HTTP_BASE`：默认 `http://127.0.0.1:3000`
-- `ONEBOT_WS_URL`：默认 `ws://127.0.0.1:3001`
-- `ONEBOT_ACCESS_TOKEN`：OneBot token（默认已内置你提供的 token，也可覆盖）
+- `SATORI_HTTP_BASE`：默认 `http://127.0.0.1:5600`
+- `SATORI_WS_URL`：默认 `ws://127.0.0.1:5600/v1/events`
+- `SATORI_TOKEN`：Satori token（默认沿用你原有 token，可覆盖）
+- `SATORI_PLATFORM`：默认 `chronocat`
+- `SATORI_SELF_ID`：可选，机器人账号 ID
+- `SATORI_PROCESSING_EMOJI`：处理中反应表情，默认 `奋斗`
 - `OPENCLAW_WS_URL`：默认 `ws://127.0.0.1:18789`
 - `OPENCLAW_GATEWAY_TOKEN`：Gateway token（默认写入了当前机器 OpenClaw 配置中的 token，可覆盖）
 - `OPENCLAW_GATEWAY_PASSWORD`：Gateway password（如你使用密码鉴权）
@@ -76,9 +79,6 @@ uv run start
   - `/op list|add|del`：OP 列表查看/增删（仅 OP 可执行；群聊也仅 OP 可执行）
   - `/help`：查看指令说明
 - 群聊未触发时也会记录该用户消息到会话上下文，等下次触发时一并带入
-- 图片消息会尝试从 OneBot 图片 URL 下载并作为附件发给 OpenClaw
-- 当消息里只有图片文件名（无 URL）时，会按 OneBot v11 调用 `get_msg` / `get_image` 补全图片信息
-- 引用消息会补查 `get_msg` 并把被引用内容结构化带入上下文
-- 合并转发消息会补查 `get_forward_msg`，提取节点摘要并带入上下文
+- 图片消息会尝试从 Satori 消息里的图片 URL 下载并作为附件发给 OpenClaw
 - 会话文本中图片会标记为 `[图片:文件哈希]`，避免多张图都只显示 `[图片]`
 - 若桥接检测到 OpenClaw 当前默认模型不支持 `image` 输入，会在回复前增加一行提示并忽略图片附件

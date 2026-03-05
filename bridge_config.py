@@ -21,11 +21,13 @@ def env_int(name: str, default: int) -> int:
 
 @dataclass
 class Config:
-    onebot_http_base: str = os.getenv("ONEBOT_HTTP_BASE", "http://127.0.0.1:3000")
-    onebot_ws_url: str = os.getenv("ONEBOT_WS_URL", "ws://127.0.0.1:3001")
-    onebot_access_token: str = os.getenv(
-        "ONEBOT_ACCESS_TOKEN", "7debeb46-2354-4b62-90d6-d308967214b3"
-    )
+    # Satori 接入参数
+    satori_http_base: str = os.getenv("SATORI_HTTP_BASE", "http://127.0.0.1:5600")
+    satori_ws_url: str = os.getenv("SATORI_WS_URL", "ws://127.0.0.1:5600/v1/events")
+    satori_token: str = os.getenv("SATORI_TOKEN", "")
+    satori_platform: str = os.getenv("SATORI_PLATFORM", "chronocat")
+    satori_self_id: str = os.getenv("SATORI_SELF_ID", os.getenv("BOT_SELF_QQ", ""))
+    satori_processing_emoji: str = os.getenv("SATORI_PROCESSING_EMOJI", "奋斗")
 
     openclaw_ws_url: str = os.getenv("OPENCLAW_WS_URL", "ws://127.0.0.1:18789")
     openclaw_gateway_token: str = os.getenv(

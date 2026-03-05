@@ -6,6 +6,7 @@ import re
 import secrets
 import time
 from collections import defaultdict, deque
+from html import unescape
 from typing import Any
 
 import aiohttp
@@ -71,6 +72,8 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self.gateway_relay_runs: set[str] = set()
         self.gateway_run_preferred_targets: dict[str, dict[str, Any]] = {}
         self.gateway_run_processing_markers: dict[str, dict[str, Any]] = {}
+        self.cleared_processing_markers: deque[str] = deque(maxlen=4000)
+        self.cleared_processing_marker_set: set[str] = set()
         self.session_onebot_routes: dict[str, dict[str, Any]] = {}
         self.op_users: set[str] = set()
         self.pairing_approved: dict[str, PairingRecord] = {}
@@ -83,6 +86,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self.image_support_cache_until: float = 0.0
         self.image_support_cache_value: bool | None = None
         self.image_support_model_desc: str = "unknown"
+        self.satori_default_route: dict[str, str] = {}
         self._load_ops_store()
         self._load_pairing_store()
 
@@ -110,6 +114,9 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             route["user_id"] = event.get("user_id")
         if event.get("group_id") is not None:
             route["group_id"] = event.get("group_id")
+        satori_route_raw = event.get("_satori_route")
+        if isinstance(satori_route_raw, dict):
+            route["_satori_route"] = dict(satori_route_raw)
         self.session_onebot_routes[key] = route
 
     @staticmethod
@@ -424,7 +431,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             if route_event is None:
                 log_io(
                     source="gateway",
-                    direction="gateway -> onebot",
+                    direction="gateway -> satori",
                     content="丢弃回复：未绑定路由",
                     received={"run_id": run_id, "payload": initial_payload},
                     sent=None,
@@ -434,7 +441,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             if not reply:
                 log_io(
                     source="gateway",
-                    direction="gateway -> onebot",
+                    direction="gateway -> satori",
                     content="丢弃回复：文本为空",
                     received={"run_id": run_id, "payload": initial_payload},
                     sent={"route_event": route_event},
@@ -444,7 +451,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             outbound_text = self._merge_hint_reply(reply_hint, reply)
             log_io(
                 source="gateway",
-                direction="gateway -> onebot",
+                direction="gateway -> satori",
                 content="转发回复",
                 received={"run_id": run_id, "payload": initial_payload, "reply": reply},
                 sent={"route_event": route_event, "message": outbound_text},
@@ -471,7 +478,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                     error_text = self._openclaw_error_reply(exc)
                     log_io(
                         source="gateway",
-                        direction="gateway -> onebot",
+                        direction="gateway -> satori",
                         content="转发错误回复",
                         received={"run_id": run_id, "payload": initial_payload, "error": str(exc)},
                         sent={"route_event": route_event, "message": error_text},
@@ -676,8 +683,8 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         processing_marker = await self._mark_processing_emoji(event)
         try:
             log_io(
-                source="onebot",
-                direction="onebot -> gateway",
+                source="satori",
+                direction="satori -> gateway",
                 content="触发新会话命令",
                 received=event,
                 sent={
@@ -758,8 +765,8 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
     ) -> None:
         async with self.sem:
             log_io(
-                source="onebot",
-                direction="onebot -> gateway",
+                source="satori",
+                direction="satori -> gateway",
                 content="接收并准备转发消息",
                 received=event,
                 sent={
@@ -774,8 +781,8 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 processing_marker = await self._mark_processing_emoji(event)
                 attachments = await self._build_image_attachments(image_candidates)
                 log_io(
-                    source="onebot",
-                    direction="onebot -> gateway",
+                    source="satori",
+                    direction="satori -> gateway",
                     content="附件构建完成并发送 chat.send",
                     received=event,
                     sent={
@@ -804,7 +811,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 if instant_text:
                     log_io(
                         source="gateway",
-                        direction="gateway -> onebot",
+                        direction="gateway -> satori",
                         content="即时回复转发",
                         received={
                             "run_id": run_id,
@@ -820,7 +827,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 if not run_id:
                     log_io(
                         source="gateway",
-                        direction="gateway -> onebot",
+                        direction="gateway -> satori",
                         content="chat.send 已受理但 ack 无 runId/text，等待异步事件",
                         received={"session_key": session_key, "ws_url": ws_url},
                         sent={"event": event},
@@ -926,6 +933,199 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         except Exception as exc:  # noqa: BLE001
             logging.warning("Shutdown close gateway failed: %s", exc)
 
+    @staticmethod
+    def _satori_parse_tag_attrs(attr_text: str) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for matched in re.finditer(r'([:\w-]+)\s*=\s*(".*?"|\'.*?\'|[^\s"\'=<>`]+)', attr_text):
+            key = matched.group(1).strip()
+            raw = matched.group(2).strip()
+            if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+                raw = raw[1:-1]
+            out[key] = unescape(raw)
+        return out
+
+    @classmethod
+    def _satori_content_to_segments(cls, content: str) -> list[dict[str, Any]]:
+        text = content or ""
+        out: list[dict[str, Any]] = []
+        tag_pattern = re.compile(r"<(/?)([A-Za-z][\w-]*)([^>]*)>")
+        last = 0
+        for matched in tag_pattern.finditer(text):
+            plain = unescape(text[last : matched.start()])
+            if plain:
+                out.append({"type": "text", "data": {"text": plain}})
+            last = matched.end()
+            if matched.group(1) == "/":
+                continue
+            tag_name = matched.group(2).lower()
+            attrs = cls._satori_parse_tag_attrs(matched.group(3) or "")
+            if tag_name == "at":
+                target = attrs.get("id") or attrs.get("qq") or attrs.get("type")
+                if target:
+                    out.append({"type": "at", "data": {"qq": str(target)}})
+                continue
+            if tag_name in {"img", "image"}:
+                src = attrs.get("src") or attrs.get("url") or ""
+                if src:
+                    out.append({"type": "image", "data": {"url": src, "file": ""}})
+                continue
+            if tag_name == "quote":
+                msg_id = attrs.get("id") or ""
+                if msg_id:
+                    out.append({"type": "reply", "data": {"id": msg_id}})
+                continue
+        tail = unescape(text[last:])
+        if tail:
+            out.append({"type": "text", "data": {"text": tail}})
+        return out
+
+    @staticmethod
+    def _segments_to_cq_text(segments: list[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for seg in segments:
+            seg_type = str(seg.get("type", "")).strip().lower()
+            data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+            if seg_type == "text":
+                parts.append(str(data.get("text", "")))
+                continue
+            if seg_type == "at":
+                qq = str(data.get("qq", "")).strip()
+                if qq:
+                    parts.append(f"[CQ:at,qq={qq}]")
+                continue
+            if seg_type == "image":
+                url = str(data.get("url", "")).strip()
+                if url:
+                    parts.append(f"[CQ:image,url={url}]")
+                else:
+                    parts.append("[CQ:image]")
+                continue
+            if seg_type in {"reply", "quote"}:
+                msg_id = str(data.get("id", "")).strip()
+                if msg_id:
+                    parts.append(f"[CQ:reply,id={msg_id}]")
+        return "".join(parts).strip()
+
+    def _update_satori_default_route(self, payload_body: dict[str, Any]) -> None:
+        logins = payload_body.get("logins")
+        if not isinstance(logins, list):
+            return
+        for raw_login in logins:
+            if not isinstance(raw_login, dict):
+                continue
+            platform = str(raw_login.get("platform") or "").strip()
+            user_raw = raw_login.get("user")
+            user = user_raw if isinstance(user_raw, dict) else {}
+            self_id = str(
+                raw_login.get("self_id")
+                or raw_login.get("selfId")
+                or user.get("id")
+                or self.cfg.satori_self_id
+                or ""
+            ).strip()
+            if not platform:
+                platform = self.cfg.satori_platform.strip()
+            if platform and self_id:
+                self.satori_default_route = {"platform": platform, "self_id": self_id}
+                return
+
+    def _convert_satori_event(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        event_type = str(payload.get("type") or "").strip().lower()
+        if event_type != "message-created":
+            return None
+        message_raw = payload.get("message")
+        message = message_raw if isinstance(message_raw, dict) else {}
+        channel_raw = payload.get("channel")
+        channel = channel_raw if isinstance(channel_raw, dict) else {}
+        user_raw = payload.get("user")
+        user = user_raw if isinstance(user_raw, dict) else {}
+        member_raw = payload.get("member")
+        member = member_raw if isinstance(member_raw, dict) else {}
+        guild_raw = payload.get("guild")
+        guild = guild_raw if isinstance(guild_raw, dict) else {}
+        login_raw = payload.get("login")
+        login = login_raw if isinstance(login_raw, dict) else {}
+        login_user_raw = login.get("user")
+        login_user = login_user_raw if isinstance(login_user_raw, dict) else {}
+
+        channel_type = str(channel.get("type") or "").strip().lower()
+        message_type = "private" if channel_type in {"direct", "private"} else "group"
+
+        user_id = str(user.get("id") or member.get("id") or "").strip()
+        if not user_id:
+            user_id = str((member.get("user") or {}).get("id") if isinstance(member.get("user"), dict) else "").strip()
+        sender_name = str(
+            member.get("nick")
+            or member.get("name")
+            or user.get("name")
+            or user.get("nick")
+            or user_id
+            or "unknown"
+        ).strip()
+
+        message_id = str(message.get("id") or payload.get("id") or "").strip()
+        content = str(message.get("content") or "").strip()
+        segments = self._satori_content_to_segments(content)
+        raw_cq = self._segments_to_cq_text(segments)
+
+        ts_raw = payload.get("timestamp") or message.get("created_at") or time.time() * 1000
+        try:
+            ts_value = float(ts_raw)
+            # Satori timestamp is ms.
+            ts_sec = int(ts_value / 1000) if ts_value > 10_000_000_000 else int(ts_value)
+        except (TypeError, ValueError):
+            ts_sec = int(time.time())
+
+        platform = str(
+            payload.get("platform")
+            or login.get("platform")
+            or self.satori_default_route.get("platform")
+            or self.cfg.satori_platform
+            or ""
+        ).strip()
+        self_id = str(
+            payload.get("self_id")
+            or payload.get("selfId")
+            or login.get("self_id")
+            or login.get("selfId")
+            or login_user.get("id")
+            or self.satori_default_route.get("self_id")
+            or self.cfg.satori_self_id
+            or ""
+        ).strip()
+        channel_id = str(channel.get("id") or "").strip()
+        if not channel_id or not user_id:
+            return None
+        group_id = str(guild.get("id") or channel_id).strip()
+        route = {
+            "platform": platform,
+            "self_id": self_id,
+            "channel_id": channel_id,
+            "guild_id": str(guild.get("id") or "").strip(),
+            "user_id": user_id,
+        }
+
+        return {
+            "post_type": "message",
+            "message_type": message_type,
+            "self_id": self_id,
+            "user_id": user_id,
+            "group_id": group_id if message_type == "group" else None,
+            "time": ts_sec,
+            "message_id": message_id or f"satori:{channel_id}:{ts_sec}",
+            "message_seq": 0,
+            "sender": {
+                "user_id": user_id,
+                "nickname": sender_name,
+                "card": sender_name if message_type == "group" else "",
+            },
+            "raw_message": raw_cq or content,
+            "message": segments,
+            "message_format": "array",
+            "_satori_route": route,
+            "_satori_event": payload,
+        }
+
     async def run(self) -> None:
         timeout = aiohttp.ClientTimeout(total=self.cfg.request_timeout_sec)
         delay = max(1, self.cfg.reconnect_delay_sec)
@@ -935,35 +1135,54 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             try:
                 while True:
                     try:
-                        logging.info("Connecting OneBot WS: %s", self.cfg.onebot_ws_url)
+                        logging.info("Connecting Satori WS: %s", self.cfg.satori_ws_url)
                         async with session.ws_connect(
-                            self.cfg.onebot_ws_url,
+                            self.cfg.satori_ws_url,
                             headers=self._onebot_headers(),
                             heartbeat=30,
                         ) as ws:
-                            logging.info("OneBot WS connected")
+                            logging.info("Satori WS connected")
                             delay = max(1, self.cfg.reconnect_delay_sec)
+                            identified = False
                             async for msg in ws:
                                 if msg.type == aiohttp.WSMsgType.TEXT:
                                     try:
                                         parsed = json.loads(msg.data)
                                     except json.JSONDecodeError:
-                                        logging.warning("OneBot non-JSON packet: %s", msg.data[:200])
+                                        logging.warning("Satori non-JSON packet: %s", msg.data[:200])
                                         continue
                                     if not isinstance(parsed, dict):
-                                        logging.warning("OneBot non-object packet: %s", msg.data[:200])
+                                        logging.warning("Satori non-object packet: %s", msg.data[:200])
                                         continue
-                                    event: dict[str, Any] = {}
-                                    for key, value in parsed.items():
-                                        event[str(key)] = value
-                                    await self._handle_onebot_event(event)
+                                    op = parsed.get("op")
+                                    body_raw = parsed.get("body")
+                                    body = body_raw if isinstance(body_raw, dict) else {}
+                                    if op == 4:
+                                        # READY/RESPONSE 共用 op=4。只在首次 READY(logins) 后发送 identify。
+                                        if not identified and isinstance(body.get("logins"), list):
+                                            self._update_satori_default_route(body)
+                                            identify_body: dict[str, Any] = {}
+                                            token = self.cfg.satori_token.strip()
+                                            if token:
+                                                identify_body["token"] = token
+                                            await ws.send_str(
+                                                json.dumps({"op": 3, "body": identify_body}, ensure_ascii=False)
+                                            )
+                                            identified = True
+                                        continue
+                                    if op == 0:
+                                        event = self._convert_satori_event(body)
+                                        if event is None:
+                                            continue
+                                        await self._handle_onebot_event(event)
+                                        continue
                                 elif msg.type in {aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED}:
                                     break
                     except asyncio.CancelledError:
-                        logging.info("Shutdown signal received, stopping OneBot loop.")
+                        logging.info("Shutdown signal received, stopping Satori loop.")
                         break
                     except Exception as exc:  # noqa: BLE001
-                        logging.exception("OneBot WS error: %s", exc)
+                        logging.exception("Satori WS error: %s", exc)
 
                     logging.info("Reconnecting in %s seconds...", delay)
                     try:
