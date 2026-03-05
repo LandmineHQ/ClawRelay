@@ -328,6 +328,20 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             return f"{hint_text}\n{reply_text}"
         return hint_text or reply_text
 
+    @staticmethod
+    def _format_error_detail(exc: Exception, max_len: int = 180) -> str:
+        detail = str(exc).strip()
+        if not detail:
+            detail = repr(exc)
+        detail = re.sub(r"\s+", " ", detail)
+        if len(detail) > max_len:
+            detail = detail[: max_len - 1].rstrip() + "…"
+        return detail
+
+    @classmethod
+    def _openclaw_error_reply(cls, exc: Exception) -> str:
+        return f"OpenClaw出错了，{cls._format_error_detail(exc)}"
+
     async def _relay_unsolicited_completion_to_onebot(
         self,
         run_id: str,
@@ -405,7 +419,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 route_event = self.session_onebot_routes.get(session_key)
             if route_event is not None:
                 try:
-                    await self._send_onebot_reply(route_event, "OpenClaw暂时不可用，请稍后再试。")
+                    await self._send_onebot_reply(route_event, self._openclaw_error_reply(exc))
                 except Exception:  # noqa: BLE001
                     logging.exception("Fallback unsolicited reply send failed")
         finally:
@@ -707,7 +721,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             except Exception as exc:  # noqa: BLE001
                 logging.exception("Bridge processing failed: %s", exc)
                 try:
-                    await self._send_onebot_reply(event, "OpenClaw暂时不可用，请稍后再试。")
+                    await self._send_onebot_reply(event, self._openclaw_error_reply(exc))
                 except Exception:  # noqa: BLE001
                     logging.exception("Fallback reply send failed")
 
