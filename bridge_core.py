@@ -1219,6 +1219,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 out.append({"type": "text", "text": plain})
             last = matched.end()
             raw_tag = matched.group(0)
+            self_closing = raw_tag.rstrip().endswith("/>")
             is_close = matched.group(1) == "/"
             tag_name = matched.group(2).lower()
             if tag_name == "quote":
@@ -1230,7 +1231,8 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 msg_id = attrs.get("id") or ""
                 if msg_id and quote_depth == 0:
                     out.append({"type": "quote", "id": msg_id})
-                quote_depth += 1
+                if not self_closing:
+                    quote_depth += 1
                 continue
             if tag_name in {"message", "author"}:
                 if quote_depth == 0:
@@ -1488,6 +1490,18 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                                                     evt_type,
                                                     body.get("sn"),
                                                 )
+                                            # Debug raw inbound event body before any conversion/handling.
+                                            try:
+                                                raw_event = json.dumps(
+                                                    body,
+                                                    ensure_ascii=False,
+                                                    separators=(",", ":"),
+                                                )
+                                            except Exception:  # noqa: BLE001
+                                                raw_event = str(body)
+                                            if len(raw_event) > 12000:
+                                                raw_event = raw_event[:11999].rstrip() + "…"
+                                            logging.info("Satori EVENT raw: %s", raw_event)
                                             sn_value = body.get("sn")
                                             try:
                                                 if sn_value is not None:
