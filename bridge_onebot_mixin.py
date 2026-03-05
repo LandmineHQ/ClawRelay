@@ -24,6 +24,8 @@ class OneBotMixin:
     seen_set: set[str]
     cleared_processing_markers: deque[str]
     cleared_processing_marker_set: set[str]
+    satori_reaction_disabled_until: float
+    satori_reaction_disable_reason: str
 
     def _onebot_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -642,6 +644,9 @@ class OneBotMixin:
         return None
 
     async def _mark_processing_emoji(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        now = datetime.now().timestamp()
+        if self.satori_reaction_disabled_until > now:
+            return None
         marker = self._processing_marker_from_event(event)
         if marker is None:
             return None
@@ -652,8 +657,10 @@ class OneBotMixin:
         }
         result = await self._satori_action("reaction.create", payload, marker["route"], timeout_sec=8)
         if result is None:
+            self.satori_reaction_disabled_until = now + 600
+            self.satori_reaction_disable_reason = "reaction.create failed (platform not supported or broken)"
             logging.warning(
-                "Failed to set processing emoji via reaction.create: message_id=%s emoji=%s emoji_id=%s",
+                "Failed to set processing emoji via reaction.create: message_id=%s emoji=%s emoji_id=%s; disable reaction marking for 600s",
                 marker.get("message_id"),
                 marker.get("emoji"),
                 marker.get("emoji_id"),
@@ -677,7 +684,7 @@ class OneBotMixin:
             "message_id": message_id,
             "emoji": emoji,
         }
-        result = await self._satori_action("reaction.clear", payload, route, timeout_sec=8)
+        result = await self._satori_action("reaction.delete", payload, route, timeout_sec=8)
         if result is not None:
             self.cleared_processing_marker_set.add(marker_key)
             self.cleared_processing_markers.append(marker_key)
@@ -687,8 +694,9 @@ class OneBotMixin:
                     old = self.cleared_processing_markers.popleft()
                     self.cleared_processing_marker_set.discard(old)
             return
+
         logging.warning(
-            "Failed to clear processing emoji via reaction.clear: message_id=%s emoji=%s emoji_id=%s",
+            "Failed to clear processing emoji via reaction.delete: message_id=%s emoji=%s emoji_id=%s",
             message_id,
             emoji,
             marker.get("emoji_id"),

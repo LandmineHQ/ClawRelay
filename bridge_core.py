@@ -86,6 +86,8 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self.image_support_cache_until: float = 0.0
         self.image_support_cache_value: bool | None = None
         self.image_support_model_desc: str = "unknown"
+        self.satori_reaction_disabled_until: float = 0.0
+        self.satori_reaction_disable_reason: str = ""
         self.satori_default_route: dict[str, str] = {}
         self.satori_last_sn: int = 0
         self._load_ops_store()
