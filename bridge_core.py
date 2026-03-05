@@ -11,6 +11,7 @@ from typing import Any
 import aiohttp
 
 from bridge_config import Config
+from bridge_logging import log_io
 from bridge_models import MessageImage, PairingRecord, PairingRequest, PendingObservation
 from bridge_onebot_mixin import OneBotMixin
 from bridge_openclaw_mixin import OpenClawGatewayMixin
@@ -386,22 +387,34 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             if route_event is None:
                 route_event = self.session_onebot_routes.get(session_key)
             if route_event is None:
-                logging.warning(
-                    "Drop OpenClaw completion without bound OneBot route: key=%s run_id=%s via=%s",
-                    session_key,
-                    run_id,
-                    relay_ws_url,
+                log_io(
+                    source="gateway",
+                    direction="gateway -> onebot",
+                    content="丢弃回复：未绑定路由",
+                    received={"run_id": run_id, "payload": initial_payload},
+                    sent=None,
+                    level=logging.WARNING,
                 )
                 return
             if not reply:
-                logging.warning(
-                    "Skip empty OpenClaw completion reply: key=%s run_id=%s via=%s",
-                    session_key,
-                    run_id,
-                    relay_ws_url,
+                log_io(
+                    source="gateway",
+                    direction="gateway -> onebot",
+                    content="丢弃回复：文本为空",
+                    received={"run_id": run_id, "payload": initial_payload},
+                    sent={"route_event": route_event},
+                    level=logging.WARNING,
                 )
                 return
-            await self._send_onebot_reply(route_event, self._merge_hint_reply(reply_hint, reply))
+            outbound_text = self._merge_hint_reply(reply_hint, reply)
+            log_io(
+                source="gateway",
+                direction="gateway -> onebot",
+                content="转发回复",
+                received={"run_id": run_id, "payload": initial_payload, "reply": reply},
+                sent={"route_event": route_event, "message": outbound_text},
+            )
+            await self._send_onebot_reply(route_event, outbound_text)
         except Exception as exc:  # noqa: BLE001
             logging.exception(
                 "Unsolicited completion relay failed: %s (key=%s run_id=%s via=%s)",
@@ -420,7 +433,16 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 route_event = self.session_onebot_routes.get(session_key)
             if route_event is not None:
                 try:
-                    await self._send_onebot_reply(route_event, self._openclaw_error_reply(exc))
+                    error_text = self._openclaw_error_reply(exc)
+                    log_io(
+                        source="gateway",
+                        direction="gateway -> onebot",
+                        content="转发错误回复",
+                        received={"run_id": run_id, "payload": initial_payload, "error": str(exc)},
+                        sent={"route_event": route_event, "message": error_text},
+                        level=logging.WARNING,
+                    )
+                    await self._send_onebot_reply(route_event, error_text)
                 except Exception:  # noqa: BLE001
                     logging.exception("Fallback unsolicited reply send failed")
         finally:
@@ -618,6 +640,18 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self.session_prompt_bootstrapped.discard(session_key)
         processing_marker = await self._mark_processing_emoji(event)
         try:
+            log_io(
+                source="onebot",
+                direction="onebot -> gateway",
+                content="触发新会话命令",
+                received=event,
+                sent={
+                    "method": "send",
+                    "sessionKey": session_key,
+                    "text": "/new",
+                    "args": {"detectCommand": True, "deliver": True},
+                },
+            )
             ws_url, run_id, instant_text = await self._trigger_openclaw_command(
                 session_key,
                 "/new",
@@ -688,24 +722,34 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         image_candidates: list[MessageImage],
     ) -> None:
         async with self.sem:
-            logging.info(
-                "Processing message user=%s group=%s key=%s text=%s images=%s",
-                event.get("user_id"),
-                event.get("group_id"),
-                session_key,
-                prompt_text[:120],
-                len(image_candidates),
+            log_io(
+                source="onebot",
+                direction="onebot -> gateway",
+                content="接收并准备转发消息",
+                received=event,
+                sent={
+                    "session_key": session_key,
+                    "prompt_text": prompt_text,
+                    "image_candidates": len(image_candidates),
+                },
             )
 
             processing_marker: dict[str, Any] | None = None
             try:
                 processing_marker = await self._mark_processing_emoji(event)
                 attachments = await self._build_image_attachments(image_candidates)
-                logging.info(
-                    "Attachment build result: candidate_images=%s attachments=%s key=%s",
-                    len(image_candidates),
-                    len(attachments),
-                    session_key,
+                log_io(
+                    source="onebot",
+                    direction="onebot -> gateway",
+                    content="附件构建完成并发送 chat.send",
+                    received=event,
+                    sent={
+                        "method": "chat.send",
+                        "sessionKey": session_key,
+                        "message": prompt_text,
+                        "candidate_images": len(image_candidates),
+                        "attachments": len(attachments),
+                    },
                 )
                 reply_hint = ""
 
@@ -723,15 +767,29 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                     attachments,
                 )
                 if instant_text:
+                    log_io(
+                        source="gateway",
+                        direction="gateway -> onebot",
+                        content="即时回复转发",
+                        received={
+                            "run_id": run_id,
+                            "session_key": session_key,
+                            "instant_text": instant_text,
+                        },
+                        sent={"event": event, "message": self._merge_hint_reply(reply_hint, instant_text)},
+                    )
                     await self._send_onebot_reply(
                         event, self._merge_hint_reply(reply_hint, instant_text)
                     )
                     return
                 if not run_id:
-                    logging.warning(
-                        "OpenClaw chat.send ack missing runId/text, waiting async events: key=%s via=%s",
-                        session_key,
-                        ws_url,
+                    log_io(
+                        source="gateway",
+                        direction="gateway -> onebot",
+                        content="chat.send 已受理但 ack 无 runId/text，等待异步事件",
+                        received={"session_key": session_key, "ws_url": ws_url},
+                        sent={"event": event},
+                        level=logging.WARNING,
                     )
                     return
 
