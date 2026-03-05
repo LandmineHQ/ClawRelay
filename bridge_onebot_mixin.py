@@ -17,6 +17,9 @@ from bridge_models import MessageImage, ParsedMessage, PendingObservation
 
 
 class OneBotMixin:
+    # 腾讯文档 EmojiType: 30 = 奋斗
+    _PROCESSING_EMOJI_ID = 30
+
     cfg: Config
     session: aiohttp.ClientSession | None
     pending_context: dict[str, deque[PendingObservation]]
@@ -598,6 +601,39 @@ class OneBotMixin:
             return None
         result = data.get("data")
         return result if isinstance(result, dict) else {}
+
+    async def _mark_processing_emoji(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        if event.get("message_type") != "group":
+            return None
+        message_id = event.get("message_id")
+        if message_id is None:
+            return None
+        payload = {
+            "message_id": message_id,
+            "emoji_id": self._PROCESSING_EMOJI_ID,
+            "set": True,
+        }
+        result = await self._onebot_action("set_msg_emoji_like", payload, timeout_sec=8)
+        if result is None:
+            return None
+        return {
+            "message_id": message_id,
+            "emoji_id": self._PROCESSING_EMOJI_ID,
+        }
+
+    async def _clear_processing_emoji(self, marker: dict[str, Any] | None) -> None:
+        if marker is None:
+            return
+        message_id = marker.get("message_id")
+        emoji_id = marker.get("emoji_id")
+        if message_id is None or emoji_id is None:
+            return
+        payload = {
+            "message_id": message_id,
+            "emoji_id": emoji_id,
+            "set": False,
+        }
+        await self._onebot_action("set_msg_emoji_like", payload, timeout_sec=8)
 
     @staticmethod
     def _compact_text(text: str) -> str:

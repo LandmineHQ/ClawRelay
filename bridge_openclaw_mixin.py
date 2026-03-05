@@ -669,6 +669,73 @@ class OpenClawGatewayMixin:
             return None, None
         return run_id, None
 
+    async def _trigger_openclaw_command_once(
+        self,
+        ws_url: str,
+        session_key: str,
+        command_text: str,
+    ) -> tuple[str | None, str | None]:
+        timeout = float(self.cfg.openclaw_timeout_sec)
+        params: dict[str, Any] = {
+            "sessionKey": session_key,
+            "text": command_text,
+            "args": {
+                # Gateway `send` 才会按命令语义解析 `/new`。
+                "detectCommand": True,
+                "deliver": True,
+                "waitForResponse": False,
+            },
+        }
+        logging.info("OpenClaw send(command) via=%s key=%s text=%s", ws_url, session_key, command_text)
+        payload = await self._gateway_shared_request(
+            ws_url,
+            "send",
+            params,
+            timeout_sec=min(20.0, timeout),
+        )
+        run_id_value = payload.get("runId")
+        run_id = str(run_id_value).strip() if isinstance(run_id_value, str) else ""
+        if run_id:
+            return run_id, None
+        text = self._extract_text_from_chat_payload(payload)
+        if text:
+            return None, text
+        return None, None
+
+    async def _trigger_openclaw_command(
+        self, session_key: str, command_text: str
+    ) -> tuple[str, str | None, str | None]:
+        urls: list[str] = []
+        ordered_sources = [
+            self.preferred_openclaw_ws_url,
+            self.cfg.openclaw_ws_url,
+        ]
+        for item in ordered_sources:
+            item = item.strip()
+            if item and item not in urls:
+                urls.append(item)
+
+        last_err: Exception | None = None
+        for url in urls:
+            try:
+                run_id, text = await self._trigger_openclaw_command_once(
+                    url, session_key, command_text
+                )
+                self.preferred_openclaw_ws_url = url
+                return url, run_id, text
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                if self.gateway_ws_url == url:
+                    await self._close_shared_gateway()
+                logging.warning(
+                    "OpenClaw command via %s failed: %s: %r",
+                    url,
+                    type(exc).__name__,
+                    exc,
+                )
+
+        raise RuntimeError(f"OpenClaw unavailable: {last_err}")
+
     async def _submit_openclaw(
         self, session_key: str, user_text: str, attachments: list[dict[str, str]]
     ) -> tuple[str, str | None, str | None]:

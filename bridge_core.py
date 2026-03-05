@@ -34,6 +34,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self.gateway_run_waiters: dict[str, asyncio.Future[None]] = {}
         self.gateway_relay_runs: set[str] = set()
         self.gateway_run_preferred_targets: dict[str, dict[str, Any]] = {}
+        self.gateway_run_processing_markers: dict[str, dict[str, Any]] = {}
         self.session_onebot_routes: dict[str, dict[str, Any]] = {}
         self.op_users: set[str] = set()
         self.pairing_approved: dict[str, PairingRecord] = {}
@@ -425,6 +426,8 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         finally:
             self.gateway_relay_runs.discard(run_id)
             self.gateway_run_preferred_targets.pop(run_id, None)
+            marker = self.gateway_run_processing_markers.pop(run_id, None)
+            await self._clear_processing_emoji(marker)
 
     async def _on_gateway_run_event(
         self, run_id: str, payload: dict[str, Any], ws_url: str
@@ -613,22 +616,17 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         # 清除桥接侧暂存上下文，并向 OpenClaw 执行 /new。
         self.pending_context[session_key].clear()
         self.session_prompt_bootstrapped.discard(session_key)
+        processing_marker = await self._mark_processing_emoji(event)
         try:
-            ws_url, run_id, instant_text = await self._submit_openclaw(
+            ws_url, run_id, instant_text = await self._trigger_openclaw_command(
                 session_key,
                 "/new",
-                [],
             )
             if instant_text:
                 await self._send_onebot_reply(event, instant_text)
                 return
             if not run_id:
-                logging.warning(
-                    "OpenClaw /new ack missing runId/text: key=%s via=%s",
-                    session_key,
-                    ws_url,
-                )
-                await self._send_onebot_reply(event, "已发送 /new，等待 OpenClaw 响应。")
+                await self._send_onebot_reply(event, "已触发 /new，当前会话已开启新上下文。")
                 return
 
             self.gateway_run_preferred_targets[run_id] = {
@@ -637,9 +635,14 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 "reply_hint": "",
                 "ws_url": ws_url,
             }
+            if processing_marker is not None:
+                self.gateway_run_processing_markers[run_id] = processing_marker
+                processing_marker = None
         except Exception as exc:  # noqa: BLE001
             logging.exception("OpenClaw /new failed: %s", exc)
             await self._send_onebot_reply(event, self._openclaw_error_reply(exc))
+        finally:
+            await self._clear_processing_emoji(processing_marker)
 
     async def _exec_pair_command(
         self, event: dict[str, Any], _session_key: str, command_body: str
@@ -694,7 +697,9 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 len(image_candidates),
             )
 
+            processing_marker: dict[str, Any] | None = None
             try:
+                processing_marker = await self._mark_processing_emoji(event)
                 attachments = await self._build_image_attachments(image_candidates)
                 logging.info(
                     "Attachment build result: candidate_images=%s attachments=%s key=%s",
@@ -736,6 +741,9 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                     "reply_hint": reply_hint,
                     "ws_url": ws_url,
                 }
+                if processing_marker is not None:
+                    self.gateway_run_processing_markers[run_id] = processing_marker
+                    processing_marker = None
                 # chat.send 成功即可返回，后续由 Gateway completion 事件自动转发到 OneBot。
             except Exception as exc:  # noqa: BLE001
                 logging.exception("Bridge processing failed: %s", exc)
@@ -743,6 +751,8 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                     await self._send_onebot_reply(event, self._openclaw_error_reply(exc))
                 except Exception:  # noqa: BLE001
                     logging.exception("Fallback reply send failed")
+            finally:
+                await self._clear_processing_emoji(processing_marker)
 
     async def _handle_onebot_event(self, event: dict[str, Any]) -> None:
         message_id = event.get("message_id")
