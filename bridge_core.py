@@ -44,7 +44,7 @@ except ModuleNotFoundError:
 
         logging.log(
             level,
-            "来源=%s | 请求方向=%s | 内容=%s | 原始接收信息=%s | 发送信息=%s",
+            "io source=%s dir=%s action=%s recv=%s sent=%s",
             source,
             direction,
             content,
@@ -97,12 +97,12 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
 
     def _discard_bg_task(self, task: asyncio.Task[Any]) -> None:
         if task.cancelled():
-            logging.info("Background task cancelled: name=%s", task.get_name())
+            logging.info("task status=cancelled name=%s", task.get_name())
         else:
             exc = task.exception()
             if exc is not None:
                 logging.error(
-                    "Background task failed: name=%s err=%s",
+                    "task status=failed name=%s err=%s",
                     task.get_name(),
                     exc,
                 )
@@ -141,7 +141,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 )
                 await self._send_onebot_reply(route_event, text)
             except Exception:  # noqa: BLE001
-                logging.exception("Failed to send private waiting notice: run_id=%s", run_id)
+                logging.exception("evt.wait_notice status=failed run_id=%s", run_id)
             idx += 1
 
     def _start_private_wait_notice(self, run_id: str, route_event: dict[str, Any]) -> None:
@@ -286,10 +286,10 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             self.op_users = {uid for uid in users if uid}
             if not self.op_users:
                 self.op_users = {"1216198007"}
-            logging.info("Loaded OP users: %s from %s", len(self.op_users), path)
+            logging.info("state.ops_store stage=load users=%s path=%s", len(self.op_users), path)
             self._save_ops_store()
         except Exception as exc:  # noqa: BLE001
-            logging.warning("Failed to load OP store %s: %s", path, exc)
+            logging.warning("state.ops_store stage=load status=failed path=%s err=%s", path, exc)
             if not self.op_users:
                 self.op_users = {"1216198007"}
 
@@ -309,7 +309,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 json.dump(payload, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, path)
         except Exception as exc:  # noqa: BLE001
-            logging.warning("Failed to save OP store %s: %s", path, exc)
+            logging.warning("state.ops_store stage=save status=failed path=%s err=%s", path, exc)
 
     def _load_pairing_store(self) -> None:
         path = self._pairing_store_path()
@@ -343,9 +343,9 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                             )
             self.pairing_approved = records
             if records:
-                logging.info("Loaded pairing records: %s from %s", len(records), path)
+                logging.info("state.pairing_store stage=load records=%s path=%s", len(records), path)
         except Exception as exc:  # noqa: BLE001
-            logging.warning("Failed to load pairing store %s: %s", path, exc)
+            logging.warning("state.pairing_store stage=load status=failed path=%s err=%s", path, exc)
 
     def _save_pairing_store(self) -> None:
         path = self._pairing_store_path()
@@ -371,7 +371,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 json.dump(payload, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, path)
         except Exception as exc:  # noqa: BLE001
-            logging.warning("Failed to save pairing store %s: %s", path, exc)
+            logging.warning("state.pairing_store stage=save status=failed path=%s err=%s", path, exc)
 
     def _pairing_code_len(self) -> int:
         return max(4, min(12, int(self.cfg.pairing_code_len)))
@@ -579,11 +579,11 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             await self._send_onebot_reply(route_event, outbound_text)
         except Exception as exc:  # noqa: BLE001
             logging.exception(
-                "Unsolicited completion relay failed: %s (key=%s run_id=%s via=%s)",
-                exc,
+                "relay.unsolicited status=failed key=%s run_id=%s via=%s err=%s",
                 session_key,
                 run_id,
                 relay_ws_url,
+                exc,
             )
             preferred = self.gateway_run_preferred_targets.get(run_id)
             route_event: dict[str, Any] | None = None
@@ -610,7 +610,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                     )
                     await self._send_onebot_reply(route_event, error_text)
                 except Exception:  # noqa: BLE001
-                    logging.exception("Fallback unsolicited reply send failed")
+                    logging.exception("relay.unsolicited status=fallback_reply_failed run_id=%s", run_id)
         finally:
             self.gateway_relay_runs.discard(run_id)
             self.gateway_run_preferred_targets.pop(run_id, None)
@@ -860,7 +860,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 self.gateway_run_processing_markers[run_id] = processing_marker
                 processing_marker = None
         except Exception as exc:  # noqa: BLE001
-            logging.exception("OpenClaw /new failed: %s", exc)
+            logging.exception("openclaw.cmd status=failed cmd=/new err=%s", exc)
             await self._send_onebot_reply(event, self._openclaw_error_reply(exc))
         finally:
             await self._clear_processing_emoji(processing_marker)
@@ -992,11 +992,11 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                     processing_marker = None
                 # chat.send 成功即可返回，后续由 Gateway completion 事件自动转发到 OneBot。
             except Exception as exc:  # noqa: BLE001
-                logging.exception("Bridge processing failed: %s", exc)
+                logging.exception("bridge.process status=failed err=%s", exc)
                 try:
                     await self._send_onebot_reply(event, self._openclaw_error_reply(exc))
                 except Exception:  # noqa: BLE001
-                    logging.exception("Fallback reply send failed")
+                    logging.exception("bridge.process status=fallback_reply_failed")
             finally:
                 await self._clear_processing_emoji(processing_marker)
 
@@ -1006,19 +1006,19 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         user_id = str(event.get("user_id") or "").strip()
         group_id = str(event.get("group_id") or "").strip()
         logging.info(
-            "Handle event start: message_id=%s message_type=%s user_id=%s group_id=%s",
+            "evt.handle stage=start message_id=%s message_type=%s user_id=%s group_id=%s",
             message_id,
             message_type,
             user_id,
             group_id,
         )
         if not self._mark_seen(message_id):
-            logging.info("Handle event skipped (seen): message_id=%s", message_id)
+            logging.info("evt.handle stage=skip reason=seen message_id=%s", message_id)
             return
 
         if not self._should_process_event(event):
             logging.info(
-                "Handle event skipped (_should_process_event=false): message_id=%s message_type=%s",
+                "evt.handle stage=skip reason=not_processable message_id=%s message_type=%s",
                 message_id,
                 message_type,
             )
@@ -1028,7 +1028,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self._bind_onebot_route(session_key, event)
         parsed = self._extract_message(event)
         logging.info(
-            "Handle event parsed(base): message_id=%s session_key=%s text_len=%s images=%s reply_ids=%s forward_ids=%s mentioned=%s",
+            "evt.handle stage=parsed_base message_id=%s session_key=%s text_len=%s images=%s reply_ids=%s forward_ids=%s mentioned=%s",
             message_id,
             session_key,
             len((parsed.text or "").strip()),
@@ -1038,10 +1038,10 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             parsed.mentioned,
         )
         try:
-            logging.info("Handle event augment begin: message_id=%s", message_id)
+            logging.info("evt.handle stage=augment_begin message_id=%s", message_id)
             parsed = await self._augment_parsed_message(event, parsed)
             logging.info(
-                "Handle event augment done: message_id=%s text_len=%s images=%s reply_ids=%s forward_ids=%s mentioned=%s",
+                "evt.handle stage=augment_done message_id=%s text_len=%s images=%s reply_ids=%s forward_ids=%s mentioned=%s",
                 message_id,
                 len((parsed.text or "").strip()),
                 len(parsed.images),
@@ -1051,7 +1051,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             )
         except Exception as exc:  # noqa: BLE001
             logging.warning(
-                "Message augment failed, continue with base parsed payload: message_id=%s err=%s",
+                "evt.handle stage=augment_failed fallback=base_parsed message_id=%s err=%s",
                 event.get("message_id"),
                 exc,
             )
@@ -1060,7 +1060,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         should_reply, latest_text = self._should_reply(event, parsed)
         local_cmd = self._detect_local_command(latest_text, parsed.images)
         logging.info(
-            "Handle event trigger decision: message_id=%s should_reply=%s local_cmd=%s latest_text_len=%s mentioned=%s",
+            "evt.handle stage=trigger_decision message_id=%s should_reply=%s local_cmd=%s latest_text_len=%s mentioned=%s",
             message_id,
             should_reply,
             local_cmd or "",
@@ -1069,13 +1069,13 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         )
         if local_cmd and (should_reply or self._is_admin_command(local_cmd)):
             logging.info(
-                "Handle event local command dispatch: message_id=%s session_key=%s command=%s",
+                "evt.handle stage=local_cmd_dispatch message_id=%s session_key=%s command=%s",
                 message_id,
                 session_key,
                 local_cmd,
             )
             await self._handle_local_command(event, session_key, local_cmd)
-            logging.info("Handle event local command done: message_id=%s", message_id)
+            logging.info("evt.handle stage=local_cmd_done message_id=%s", message_id)
             return
 
         # Private chat: send user content directly to OpenClaw without local prompt building.
@@ -1086,10 +1086,10 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                     session_key,
                     normalized_text[:120],
                 )
-                logging.info("Handle event exit(private no reply): message_id=%s", message_id)
+                logging.info("evt.handle stage=exit reason=private_no_reply message_id=%s", message_id)
                 return
             if not await self._ensure_target_pairing(event, session_key):
-                logging.info("Handle event exit(private not paired): message_id=%s", message_id)
+                logging.info("evt.handle stage=exit reason=private_not_paired message_id=%s", message_id)
                 return
             task = asyncio.create_task(
                 self._process_message(
@@ -1101,7 +1101,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 )
             )
             logging.info(
-                "Handle event private task created: message_id=%s session_key=%s task=%s",
+                "evt.handle stage=private_task_created message_id=%s session_key=%s task=%s",
                 message_id,
                 session_key,
                 task.get_name(),
@@ -1112,24 +1112,24 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
 
         self._record_observation(event, session_key, parsed)
         logging.info(
-            "Handle event observation recorded: message_id=%s session_key=%s should_reply=%s pending_size=%s",
+            "evt.handle stage=observation_recorded message_id=%s session_key=%s should_reply=%s pending_size=%s",
             message_id,
             session_key,
             should_reply,
             len(self.pending_context[session_key]),
         )
         if not should_reply:
-            logging.info("Handle event exit(group no reply): message_id=%s", message_id)
+            logging.info("evt.handle stage=exit reason=group_no_reply message_id=%s", message_id)
             return
         if not await self._ensure_target_pairing(event, session_key):
-            logging.info("Handle event exit(group not paired): message_id=%s", message_id)
+            logging.info("evt.handle stage=exit reason=group_not_paired message_id=%s", message_id)
             return
 
         pending = list(self.pending_context[session_key])
         self.pending_context[session_key].clear()
         latest_line = pending[-1].line if pending else latest_text.strip()
         logging.info(
-            "Handle event building prompt: message_id=%s pending_count=%s latest_line_len=%s",
+            "evt.handle stage=build_prompt message_id=%s pending_count=%s latest_line_len=%s",
             message_id,
             len(pending),
             len((latest_line or "").strip()),
@@ -1143,7 +1143,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             bot_user_id=self._get_self_qq(event),
         )
         logging.info(
-            "Handle event prompt ready: message_id=%s prompt_len=%s include_guidance=%s",
+            "evt.handle stage=prompt_ready message_id=%s prompt_len=%s include_guidance=%s",
             message_id,
             len(prompt_text),
             include_guidance,
@@ -1160,7 +1160,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             )
         )
         logging.info(
-            "Handle event group task created: message_id=%s session_key=%s task=%s image_candidates=%s",
+            "evt.handle stage=group_task_created message_id=%s session_key=%s task=%s image_candidates=%s",
             message_id,
             session_key,
             task.get_name(),
@@ -1181,7 +1181,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         try:
             await self._close_shared_gateway()
         except Exception as exc:  # noqa: BLE001
-            logging.warning("Shutdown close gateway failed: %s", exc)
+            logging.warning("runtime.shutdown stage=close_gateway status=failed err=%s", exc)
 
     async def _satori_ping_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         try:
@@ -1193,7 +1193,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         except asyncio.CancelledError:
             return
         except Exception as exc:  # noqa: BLE001
-            logging.warning("Satori ping loop stopped: %s", exc)
+            logging.warning("ws.ping status=stopped err=%s", exc)
 
     @staticmethod
     def _satori_parse_tag_attrs(attr_text: str) -> dict[str, str]:
@@ -1384,7 +1384,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             )
         if not channel_id or not user_id:
             logging.warning(
-                "Satori message-created dropped: missing channel_id/user_id (keys=%s)",
+                "evt.convert status=dropped reason=missing_channel_or_user keys=%s",
                 sorted(payload.keys()),
             )
             return None
@@ -1427,13 +1427,13 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             try:
                 while True:
                     try:
-                        logging.info("Connecting Satori WS: %s", self.cfg.satori_ws_url)
+                        logging.info("ws stage=connect url=%s", self.cfg.satori_ws_url)
                         async with session.ws_connect(
                             self.cfg.satori_ws_url,
                             headers=self._onebot_headers(),
                             heartbeat=30,
                         ) as ws:
-                            logging.info("Satori WS connected")
+                            logging.info("ws stage=connected")
                             delay = max(1, self.cfg.reconnect_delay_sec)
                             identify_body: dict[str, Any] = {}
                             token = self.cfg.satori_token.strip()
@@ -1446,7 +1446,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                                 json.dumps({"op": 3, "body": identify_body}, ensure_ascii=False)
                             )
                             logging.info(
-                                "Satori IDENTIFY sent (token=%s sn=%s)",
+                                "ws stage=identify_sent token=%s sn=%s",
                                 "set" if bool(token) else "empty",
                                 identify_body.get("sn"),
                             )
@@ -1457,10 +1457,10 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                                         try:
                                             parsed = json.loads(msg.data)
                                         except json.JSONDecodeError:
-                                            logging.warning("Satori non-JSON packet: %s", msg.data[:200])
+                                            logging.warning("ws packet=non_json data=%s", msg.data[:200])
                                             continue
                                         if not isinstance(parsed, dict):
-                                            logging.warning("Satori non-object packet: %s", msg.data[:200])
+                                            logging.warning("ws packet=non_object data=%s", msg.data[:200])
                                             continue
                                         op_raw = parsed.get("op")
                                         op: int | None
@@ -1479,14 +1479,14 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                                         # READY：更新默认登录路由信息。
                                         if op == 4:
                                             self._update_satori_default_route(body)
-                                            logging.info("Satori READY received")
+                                            logging.info("ws event=ready")
                                             continue
                                         # EVENT：处理消息事件，并更新 sn 以便断线续传。
                                         if op == 0:
                                             evt_type = str(body.get("type") or "").strip()
                                             if evt_type:
                                                 logging.info(
-                                                    "Satori EVENT received: type=%s sn=%s",
+                                                    "ws event=recv type=%s sn=%s",
                                                     evt_type,
                                                     body.get("sn"),
                                                 )
@@ -1501,7 +1501,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                                                 raw_event = str(body)
                                             if len(raw_event) > 12000:
                                                 raw_event = raw_event[:11999].rstrip() + "…"
-                                            logging.info("Satori EVENT raw: %s", raw_event)
+                                            logging.info("ws event=raw payload=%s", raw_event)
                                             sn_value = body.get("sn")
                                             try:
                                                 if sn_value is not None:
@@ -1512,7 +1512,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                                             if event is None:
                                                 if evt_type:
                                                     logging.info(
-                                                        "Satori EVENT ignored by bridge parser: type=%s sn=%s",
+                                                        "ws event=ignored_by_parser type=%s sn=%s",
                                                         evt_type,
                                                         body.get("sn"),
                                                     )
@@ -1521,7 +1521,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                                                 await self._handle_onebot_event(event)
                                             except Exception as exc:  # noqa: BLE001
                                                 logging.exception(
-                                                    "Satori event handling failed but ignored: type=%s sn=%s err=%s",
+                                                    "ws event=handle_failed_ignored type=%s sn=%s err=%s",
                                                     evt_type or "unknown",
                                                     body.get("sn"),
                                                     exc,
@@ -1529,7 +1529,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                                             continue
                                         # PONG/其它 op：当前无需处理。
                                         if op not in {0, 1, 2, 4, 5, None}:
-                                            logging.info("Satori packet ignored: op=%s keys=%s", op_raw, sorted(parsed.keys()))
+                                            logging.info("ws packet=ignored op=%s keys=%s", op_raw, sorted(parsed.keys()))
                                         continue
                                     if msg.type in {aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED}:
                                         break
@@ -1540,16 +1540,16 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                                 except asyncio.CancelledError:
                                     pass
                     except asyncio.CancelledError:
-                        logging.info("Shutdown signal received, stopping Satori loop.")
+                        logging.info("ws stage=stopping reason=shutdown_signal")
                         break
                     except Exception as exc:  # noqa: BLE001
-                        logging.exception("Satori WS error: %s", exc)
+                        logging.exception("ws stage=error err=%s", exc)
 
-                    logging.info("Reconnecting in %s seconds...", delay)
+                    logging.info("ws stage=reconnect_wait delay_sec=%s", delay)
                     try:
                         await asyncio.sleep(delay)
                     except asyncio.CancelledError:
-                        logging.info("Shutdown signal received during reconnect wait.")
+                        logging.info("ws stage=stopping reason=shutdown_during_reconnect_wait")
                         break
                     delay = min(delay * 2, max(delay, self.cfg.max_reconnect_delay_sec))
             finally:

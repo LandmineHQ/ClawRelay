@@ -30,7 +30,7 @@ def log_io(
 ) -> None:
     logging.log(
         level,
-        "来源=%s | 请求方向=%s | 内容=%s | 原始接收信息=%s | 发送信息=%s",
+        "io source=%s dir=%s action=%s recv=%s sent=%s",
         source,
         direction,
         content,

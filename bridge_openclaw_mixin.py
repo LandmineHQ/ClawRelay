@@ -208,13 +208,13 @@ class OpenClawGatewayMixin:
                             await self._on_gateway_run_event(run_id, payload, ws_url)
                         except Exception as exc:  # noqa: BLE001
                             logging.warning(
-                                "Gateway run event hook failed: run_id=%s via=%s err=%s",
+                                "gateway.run_hook status=failed run_id=%s via=%s err=%s",
                                 run_id,
                                 ws_url,
                                 exc,
                             )
         except Exception as exc:  # noqa: BLE001
-            logging.warning("Shared OpenClaw gateway loop closed via=%s: %s", ws_url, exc)
+            logging.warning("gateway.shared_loop status=closed via=%s err=%s", ws_url, exc)
         finally:
             if self.gateway_ws is ws:
                 self.gateway_ws = None
@@ -531,7 +531,7 @@ class OpenClawGatewayMixin:
                 if ws is not None:
                     await ws.close()
 
-        logging.warning("Image model capability probe failed: %s", last_err)
+        logging.warning("openclaw.model_probe status=failed err=%s", last_err)
         return True, "unknown"
 
     async def _wait_shared_run_result(
@@ -565,7 +565,7 @@ class OpenClawGatewayMixin:
                     done = True
                 else:
                     logging.warning(
-                        "OpenClaw final event has no text (%s): key=%s run_id=%s payload_keys=%s",
+                        "openclaw.run stage=consume status=completion_no_text source=%s key=%s run_id=%s payload_keys=%s",
                         source,
                         session_key,
                         run_id,
@@ -588,7 +588,7 @@ class OpenClawGatewayMixin:
             now = loop.time()
             if now >= deadline:
                 logging.warning(
-                    "OpenClaw run timeout waiting text: key=%s run_id=%s via=%s",
+                    "openclaw.run status=timeout key=%s run_id=%s via=%s",
                     session_key,
                     run_id,
                     ws_url,
@@ -617,7 +617,7 @@ class OpenClawGatewayMixin:
         if latest_text:
             return latest_text
         logging.warning(
-            "OpenClaw run finished without text: key=%s run_id=%s via=%s",
+            "openclaw.run status=done_no_text key=%s run_id=%s via=%s",
             session_key,
             run_id,
             ws_url,
@@ -643,7 +643,7 @@ class OpenClawGatewayMixin:
             chat_params["attachments"] = attachments
 
         logging.info(
-            "OpenClaw chat.send via=%s key=%s attachments=%s",
+            "openclaw.chat_send stage=submit via=%s key=%s attachments=%s",
             ws_url,
             session_key,
             len(attachments),
@@ -663,7 +663,7 @@ class OpenClawGatewayMixin:
             if text:
                 return None, text
             logging.warning(
-                "OpenClaw chat.send ack missing runId and text: key=%s via=%s payload_keys=%s",
+                "openclaw.chat_send stage=ack status=missing_runid_and_text key=%s via=%s payload_keys=%s",
                 session_key,
                 ws_url,
                 sorted(payload.keys()),
@@ -685,7 +685,12 @@ class OpenClawGatewayMixin:
             "message": command_text,
             "idempotencyKey": str(uuid.uuid4()),
         }
-        logging.info("OpenClaw send(command) via=%s key=%s text=%s", ws_url, session_key, command_text)
+        logging.info(
+            "openclaw.send_cmd stage=submit via=%s key=%s text=%s",
+            ws_url,
+            session_key,
+            command_text,
+        )
         try:
             payload = await self._gateway_shared_request(
                 ws_url,
@@ -702,7 +707,7 @@ class OpenClawGatewayMixin:
                 return None, text
         except Exception as exc:  # noqa: BLE001
             logging.warning(
-                "OpenClaw send(command) rejected, fallback to chat.send: key=%s via=%s err=%s",
+                "openclaw.send_cmd stage=submit status=rejected_fallback_chat_send key=%s via=%s err=%s",
                 session_key,
                 ws_url,
                 exc,
@@ -737,7 +742,7 @@ class OpenClawGatewayMixin:
                 if self.gateway_ws_url == url:
                     await self._close_shared_gateway()
                 logging.warning(
-                    "OpenClaw command via %s failed: %s: %r",
+                    "openclaw.send_cmd status=failed via=%s err_type=%s err=%r",
                     url,
                     type(exc).__name__,
                     exc,
@@ -771,7 +776,7 @@ class OpenClawGatewayMixin:
                 if self.gateway_ws_url == url:
                     await self._close_shared_gateway()
                 logging.warning(
-                    "OpenClaw connection via %s failed: %s: %r",
+                    "openclaw.chat_send status=failed via=%s err_type=%s err=%r",
                     url,
                     type(exc).__name__,
                     exc,

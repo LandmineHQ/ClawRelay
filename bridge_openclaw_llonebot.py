@@ -26,7 +26,7 @@ async def main() -> None:
     def _request_shutdown(sig_name: str) -> None:
         if stop_event.is_set():
             return
-        logging.info("Shutdown signal received: %s", sig_name)
+        logging.info("runtime.signal stage=received name=%s", sig_name)
         stop_event.set()
 
     for sig_name in ("SIGINT", "SIGTERM", "SIGHUP"):
@@ -67,7 +67,7 @@ def cli() -> None:
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("Bridge stopped by user.")
+        logging.info("runtime status=stopped reason=keyboard_interrupt")
 
 
 if __name__ == "__main__":

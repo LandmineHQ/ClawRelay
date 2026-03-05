@@ -62,7 +62,7 @@ class OneBotMixin:
     ) -> dict[str, Any] | None:
         assert self.session is not None
         if route is None:
-            logging.warning("Satori action %s missing route", action)
+            logging.warning("api.satori action=%s status=skip reason=missing_route", action)
             return None
         headers = self._onebot_headers()
         headers["Satori-Platform"] = route["platform"]
@@ -79,13 +79,18 @@ class OneBotMixin:
                 if resp.status >= 400:
                     if action == "message.get":
                         logging.info(
-                            "Satori action %s HTTP %s (will try fallback): %s",
+                            "api.satori action=%s status=http_error code=%s fallback=forward_internal detail=%s",
                             action,
                             resp.status,
                             text[:200],
                         )
                     else:
-                        logging.warning("Satori action %s HTTP %s: %s", action, resp.status, text[:200])
+                        logging.warning(
+                            "api.satori action=%s status=http_error code=%s detail=%s",
+                            action,
+                            resp.status,
+                            text[:200],
+                        )
                     return None
                 if not text.strip():
                     return {}
@@ -95,9 +100,13 @@ class OneBotMixin:
                     return {}
         except Exception as exc:  # noqa: BLE001
             if action == "message.get":
-                logging.info("Satori action %s failed (will try fallback): %s", action, exc)
+                logging.info(
+                    "api.satori action=%s status=error fallback=forward_internal err=%s",
+                    action,
+                    exc,
+                )
             else:
-                logging.warning("Satori action %s failed: %s", action, exc)
+                logging.warning("api.satori action=%s status=error err=%s", action, exc)
             return None
         if isinstance(parsed, dict):
             return parsed
@@ -617,7 +626,7 @@ class OneBotMixin:
             self.satori_reaction_disabled_until = now + 600
             self.satori_reaction_disable_reason = "reaction.create failed (platform not supported or broken)"
             logging.warning(
-                "Failed to set processing emoji via reaction.create: message_id=%s emoji_id=%s; disable reaction marking for 600s",
+                "reaction stage=mark status=failed action=reaction.create message_id=%s emoji_id=%s disable_sec=600",
                 marker.get("message_id"),
                 marker.get("emoji_id"),
             )
@@ -652,7 +661,7 @@ class OneBotMixin:
             return
 
         logging.warning(
-            "Failed to clear processing emoji via reaction.delete: message_id=%s emoji_id=%s",
+            "reaction stage=clear status=failed action=reaction.delete message_id=%s emoji_id=%s",
             message_id,
             emoji_id,
         )
@@ -895,7 +904,7 @@ class OneBotMixin:
             return ""
         if depth > 4:
             logging.warning(
-                "Nested forward depth limit reached: channel_id=%s message_id=%s depth=%s",
+                "fb.forward stage=resolve_nested status=skip reason=depth_limit channel_id=%s message_id=%s depth=%s",
                 route.get("channel_id"),
                 forward_id,
                 depth,
@@ -903,7 +912,7 @@ class OneBotMixin:
             return ""
         if forward_id in seen_forward_ids:
             logging.warning(
-                "Nested forward cycle detected: channel_id=%s message_id=%s",
+                "fb.forward stage=resolve_nested status=skip reason=cycle_detected channel_id=%s message_id=%s",
                 route.get("channel_id"),
                 forward_id,
             )
@@ -994,7 +1003,7 @@ class OneBotMixin:
             return data, False
 
         logging.info(
-            "Satori message.get fallback triggered: channel_id=%s message_id=%s -> internal/onebot11/get_forward_msg",
+            "fb.forward stage=trigger channel_id=%s message_id=%s action=internal/onebot11/get_forward_msg",
             route.get("channel_id"),
             message_id,
         )
@@ -1004,9 +1013,21 @@ class OneBotMixin:
             route,
             timeout_sec=10,
         )
+        try:
+            raw_internal_text = json.dumps(internal_raw, ensure_ascii=False, separators=(",", ":"))
+        except Exception:  # noqa: BLE001
+            raw_internal_text = str(internal_raw)
+        if len(raw_internal_text) > 12000:
+            raw_internal_text = raw_internal_text[:11999].rstrip() + "…"
+        logging.info(
+            "fb.forward stage=internal_raw channel_id=%s message_id=%s payload=%s",
+            route.get("channel_id"),
+            message_id,
+            raw_internal_text,
+        )
         if not isinstance(internal_raw, dict):
             logging.warning(
-                "Satori message.get fallback failed: internal response invalid, channel_id=%s message_id=%s",
+                "fb.forward stage=fail reason=invalid_internal_response channel_id=%s message_id=%s",
                 route.get("channel_id"),
                 message_id,
             )
@@ -1042,7 +1063,7 @@ class OneBotMixin:
                 if len(preview) > 240:
                     preview = preview[:239].rstrip() + "…"
                 logging.info(
-                    "Satori message.get fallback hit: channel_id=%s message_id=%s forward_nodes=%s node_ids=%s content_preview=%s",
+                    "fb.forward stage=hit channel_id=%s message_id=%s forward_nodes=%s node_ids=%s content_preview=%s",
                     route.get("channel_id"),
                     message_id,
                     len(msg_raw),
@@ -1051,7 +1072,7 @@ class OneBotMixin:
                 )
                 return synthesized, True
         logging.warning(
-            "Satori message.get fallback failed: no forward messages, channel_id=%s message_id=%s",
+            "fb.forward stage=fail reason=no_forward_messages channel_id=%s message_id=%s",
             route.get("channel_id"),
             message_id,
         )
@@ -1086,7 +1107,7 @@ class OneBotMixin:
                 )
             except Exception as exc:  # noqa: BLE001
                 logging.warning(
-                    "Quote fallback chain failed but ignored: channel_id=%s message_id=%s err=%s",
+                    "ctx.quote stage=augment status=ignored_error channel_id=%s message_id=%s err=%s",
                     route.get("channel_id"),
                     reply_id,
                     exc,
@@ -1137,7 +1158,7 @@ class OneBotMixin:
                 )
             except Exception as exc:  # noqa: BLE001
                 logging.warning(
-                    "Forward fallback chain failed but ignored: channel_id=%s message_id=%s err=%s",
+                    "ctx.forward stage=augment status=ignored_error channel_id=%s message_id=%s err=%s",
                     route.get("channel_id"),
                     forward_id,
                     exc,
@@ -1386,19 +1407,30 @@ class OneBotMixin:
                 break
             url = img.url.strip()
             if not url:
-                logging.warning("Skip image without url (file=%s)", img.file)
+                logging.warning("media.image stage=skip reason=missing_url file=%s", img.file)
                 continue
             if not (url.startswith("http://") or url.startswith("https://")):
-                logging.warning("Skip image without downloadable url (file=%s)", img.file)
+                logging.warning(
+                    "media.image stage=skip reason=non_http_url file=%s",
+                    img.file,
+                )
                 continue
 
             try:
                 content, ctype = await self._download_image(url)
                 if not content:
-                    logging.warning("Skip image download failed (file=%s url=%s)", img.file, url)
+                    logging.warning(
+                        "media.image stage=skip reason=download_failed file=%s url=%s",
+                        img.file,
+                        url,
+                    )
                     continue
                 if len(content) > max_bytes:
-                    logging.warning("Skip image too large (%s bytes): %s", len(content), url)
+                    logging.warning(
+                        "media.image stage=skip reason=too_large bytes=%s url=%s",
+                        len(content),
+                        url,
+                    )
                     continue
 
                 mime_type = self._guess_image_mime(url, img.file, ctype)
@@ -1410,6 +1442,6 @@ class OneBotMixin:
                     }
                 )
             except Exception as exc:  # noqa: BLE001
-                logging.warning("Failed to fetch image %s: %s", url, exc)
+                logging.warning("media.image stage=fetch status=failed url=%s err=%s", url, exc)
 
         return out
