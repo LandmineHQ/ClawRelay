@@ -28,6 +28,7 @@ dev = [
 py-modules = [
     "bridge_openclaw_llonebot",
     "bridge_core",
+    "bridge_logging",
     "bridge_config",
     "bridge_models",
     "bridge_onebot_mixin",

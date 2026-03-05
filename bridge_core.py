@@ -11,10 +11,45 @@ from typing import Any
 import aiohttp
 
 from bridge_config import Config
-from bridge_logging import log_io
 from bridge_models import MessageImage, PairingRecord, PairingRequest, PendingObservation
 from bridge_onebot_mixin import OneBotMixin
 from bridge_openclaw_mixin import OpenClawGatewayMixin
+
+try:
+    from bridge_logging import log_io
+except ModuleNotFoundError:
+    def log_io(
+        source: str,
+        direction: str,
+        content: str,
+        received: Any = None,
+        sent: Any = None,
+        *,
+        level: int = logging.INFO,
+    ) -> None:
+        def _fmt(value: Any, max_len: int = 1800) -> str:
+            if value is None:
+                return "-"
+            try:
+                if isinstance(value, str):
+                    text = re.sub(r"\s+", " ", value).strip()
+                else:
+                    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            except Exception:  # noqa: BLE001
+                text = str(value)
+            if len(text) > max_len:
+                return text[: max_len - 1].rstrip() + "…"
+            return text
+
+        logging.log(
+            level,
+            "来源=%s | 请求方向=%s | 内容=%s | 原始接收信息=%s | 发送信息=%s",
+            source,
+            direction,
+            content,
+            _fmt(received),
+            _fmt(sent),
+        )
 
 
 class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
@@ -879,41 +914,64 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self.bg_tasks.add(task)
         task.add_done_callback(self._discard_bg_task)
 
+    async def _shutdown_runtime(self) -> None:
+        pending_tasks = [task for task in self.bg_tasks if not task.done()]
+        for task in pending_tasks:
+            task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+        self.bg_tasks.clear()
+        try:
+            await self._close_shared_gateway()
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Shutdown close gateway failed: %s", exc)
+
     async def run(self) -> None:
         timeout = aiohttp.ClientTimeout(total=self.cfg.request_timeout_sec)
         delay = max(1, self.cfg.reconnect_delay_sec)
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
             self.session = session
-            while True:
-                try:
-                    logging.info("Connecting OneBot WS: %s", self.cfg.onebot_ws_url)
-                    async with session.ws_connect(
-                        self.cfg.onebot_ws_url,
-                        headers=self._onebot_headers(),
-                        heartbeat=30,
-                    ) as ws:
-                        logging.info("OneBot WS connected")
-                        delay = max(1, self.cfg.reconnect_delay_sec)
-                        async for msg in ws:
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                try:
-                                    parsed = json.loads(msg.data)
-                                except json.JSONDecodeError:
-                                    logging.warning("OneBot non-JSON packet: %s", msg.data[:200])
-                                    continue
-                                if not isinstance(parsed, dict):
-                                    logging.warning("OneBot non-object packet: %s", msg.data[:200])
-                                    continue
-                                event: dict[str, Any] = {}
-                                for key, value in parsed.items():
-                                    event[str(key)] = value
-                                await self._handle_onebot_event(event)
-                            elif msg.type in {aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED}:
-                                break
-                except Exception as exc:  # noqa: BLE001
-                    logging.exception("OneBot WS error: %s", exc)
+            try:
+                while True:
+                    try:
+                        logging.info("Connecting OneBot WS: %s", self.cfg.onebot_ws_url)
+                        async with session.ws_connect(
+                            self.cfg.onebot_ws_url,
+                            headers=self._onebot_headers(),
+                            heartbeat=30,
+                        ) as ws:
+                            logging.info("OneBot WS connected")
+                            delay = max(1, self.cfg.reconnect_delay_sec)
+                            async for msg in ws:
+                                if msg.type == aiohttp.WSMsgType.TEXT:
+                                    try:
+                                        parsed = json.loads(msg.data)
+                                    except json.JSONDecodeError:
+                                        logging.warning("OneBot non-JSON packet: %s", msg.data[:200])
+                                        continue
+                                    if not isinstance(parsed, dict):
+                                        logging.warning("OneBot non-object packet: %s", msg.data[:200])
+                                        continue
+                                    event: dict[str, Any] = {}
+                                    for key, value in parsed.items():
+                                        event[str(key)] = value
+                                    await self._handle_onebot_event(event)
+                                elif msg.type in {aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED}:
+                                    break
+                    except asyncio.CancelledError:
+                        logging.info("Shutdown signal received, stopping OneBot loop.")
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        logging.exception("OneBot WS error: %s", exc)
 
-                logging.info("Reconnecting in %s seconds...", delay)
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, max(delay, self.cfg.max_reconnect_delay_sec))
+                    logging.info("Reconnecting in %s seconds...", delay)
+                    try:
+                        await asyncio.sleep(delay)
+                    except asyncio.CancelledError:
+                        logging.info("Shutdown signal received during reconnect wait.")
+                        break
+                    delay = min(delay * 2, max(delay, self.cfg.max_reconnect_delay_sec))
+            finally:
+                await self._shutdown_runtime()
+                self.session = None
