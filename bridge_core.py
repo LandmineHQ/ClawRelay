@@ -1001,7 +1001,14 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         session_key = self._build_session_key(event)
         self._bind_onebot_route(session_key, event)
         parsed = self._extract_message(event)
-        parsed = await self._augment_parsed_message(event, parsed)
+        try:
+            parsed = await self._augment_parsed_message(event, parsed)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning(
+                "Message augment failed, continue with base parsed payload: message_id=%s err=%s",
+                event.get("message_id"),
+                exc,
+            )
         normalized_text = parsed.text.strip()
 
         should_reply, latest_text = self._should_reply(event, parsed)
@@ -1114,6 +1121,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             if plain and quote_depth == 0:
                 out.append({"type": "text", "text": plain})
             last = matched.end()
+            raw_tag = matched.group(0)
             is_close = matched.group(1) == "/"
             tag_name = matched.group(2).lower()
             if tag_name == "quote":
@@ -1126,6 +1134,10 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 if msg_id and quote_depth == 0:
                     out.append({"type": "quote", "id": msg_id})
                 quote_depth += 1
+                continue
+            if tag_name in {"message", "author"}:
+                if quote_depth == 0:
+                    out.append({"type": "text", "text": raw_tag})
                 continue
             if is_close or quote_depth > 0:
                 continue
@@ -1394,7 +1406,15 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                                                         body.get("sn"),
                                                     )
                                                 continue
-                                            await self._handle_onebot_event(event)
+                                            try:
+                                                await self._handle_onebot_event(event)
+                                            except Exception as exc:  # noqa: BLE001
+                                                logging.exception(
+                                                    "Satori event handling failed but ignored: type=%s sn=%s err=%s",
+                                                    evt_type or "unknown",
+                                                    body.get("sn"),
+                                                    exc,
+                                                )
                                             continue
                                         # PONG/其它 op：当前无需处理。
                                         if op not in {0, 1, 2, 4, 5, None}:
