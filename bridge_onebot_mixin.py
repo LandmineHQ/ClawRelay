@@ -17,11 +17,6 @@ from bridge_models import MessageImage, ParsedMessage, PendingObservation
 
 
 class OneBotMixin:
-    _PROCESSING_EMOJI = "奋斗"
-    _QQ_EMOJI_NAME_TO_ID: dict[str, int] = {
-        "奋斗": 30,
-    }
-
     cfg: Config
     session: aiohttp.ClientSession | None
     pending_context: dict[str, deque[PendingObservation]]
@@ -95,56 +90,6 @@ class OneBotMixin:
         if isinstance(parsed, dict):
             return parsed
         return {}
-
-    async def _satori_internal_action(
-        self,
-        method: str,
-        payload: dict[str, Any],
-        route: dict[str, str] | None,
-        timeout_sec: float | None = None,
-    ) -> dict[str, Any] | None:
-        assert self.session is not None
-        if route is None:
-            return None
-        headers = self._onebot_headers()
-        headers["Satori-Platform"] = route["platform"]
-        headers["Satori-User-ID"] = route["self_id"]
-        url = f"{self._satori_api_base()}/internal/{method}"
-        try:
-            async with self.session.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=timeout_sec) if timeout_sec else None,
-            ) as resp:
-                text = await resp.text()
-                if resp.status >= 400:
-                    logging.warning("Satori internal %s HTTP %s: %s", method, resp.status, text[:200])
-                    return None
-                if not text.strip():
-                    return {}
-                try:
-                    parsed = json.loads(text)
-                except json.JSONDecodeError:
-                    return {}
-        except Exception as exc:  # noqa: BLE001
-            logging.warning("Satori internal %s failed: %s", method, exc)
-            return None
-        if isinstance(parsed, dict):
-            return parsed
-        return {}
-
-    @classmethod
-    def _qq_emoji_id_from_value(cls, value: Any) -> int | None:
-        raw = str(value or "").strip()
-        if not raw:
-            return None
-        if raw.isdigit():
-            try:
-                return int(raw)
-            except ValueError:
-                return None
-        return cls._QQ_EMOJI_NAME_TO_ID.get(raw)
 
     def _build_session_key(self, event: dict[str, Any]) -> str:
         if event.get("message_type") == "private":
@@ -706,31 +651,15 @@ class OneBotMixin:
             "emoji": marker["emoji"],
         }
         result = await self._satori_action("reaction.create", payload, marker["route"], timeout_sec=8)
-        if result is not None:
-            return marker
-
-        # llonebot 当前 reaction.create 可能不兼容，回退到内部 OneBot API。
-        emoji_id = self._qq_emoji_id_from_value(marker.get("emoji"))
-        if emoji_id is not None:
-            fallback = await self._satori_internal_action(
-                "set_msg_emoji_like",
-                {
-                    "message_id": marker["message_id"],
-                    "emoji_id": emoji_id,
-                    "set": True,
-                },
-                marker["route"],
-                timeout_sec=8,
+        if result is None:
+            logging.warning(
+                "Failed to set processing emoji via reaction.create: message_id=%s emoji=%s emoji_id=%s",
+                marker.get("message_id"),
+                marker.get("emoji"),
+                marker.get("emoji_id"),
             )
-            if fallback is not None:
-                return marker
-
-        logging.warning(
-            "Failed to set processing emoji: message_id=%s emoji=%s",
-            marker.get("message_id"),
-            marker.get("emoji"),
-        )
-        return None
+            return None
+        return marker
 
     async def _clear_processing_emoji(self, marker: dict[str, Any] | None) -> None:
         if marker is None:
@@ -748,20 +677,7 @@ class OneBotMixin:
             "message_id": message_id,
             "emoji": emoji,
         }
-        result = await self._satori_action("reaction.delete", payload, route, timeout_sec=8)
-        if result is None:
-            emoji_id = self._qq_emoji_id_from_value(emoji)
-            if emoji_id is not None:
-                result = await self._satori_internal_action(
-                    "set_msg_emoji_like",
-                    {
-                        "message_id": message_id,
-                        "emoji_id": emoji_id,
-                        "set": False,
-                    },
-                    route,
-                    timeout_sec=8,
-                )
+        result = await self._satori_action("reaction.clear", payload, route, timeout_sec=8)
         if result is not None:
             self.cleared_processing_marker_set.add(marker_key)
             self.cleared_processing_markers.append(marker_key)
@@ -772,9 +688,10 @@ class OneBotMixin:
                     self.cleared_processing_marker_set.discard(old)
             return
         logging.warning(
-            "Failed to clear processing emoji: message_id=%s emoji=%s",
+            "Failed to clear processing emoji via reaction.clear: message_id=%s emoji=%s emoji_id=%s",
             message_id,
             emoji,
+            marker.get("emoji_id"),
         )
         # 部分实现在重复状态下会返回 failed，但视觉结果可能已生效，这里仍做去重以免重复刷接口。
         self.cleared_processing_marker_set.add(marker_key)
@@ -794,9 +711,14 @@ class OneBotMixin:
         route = self._satori_route_from_event(event)
         if route is None:
             return None
+        emoji_id = int(self.cfg.satori_processing_emoji_id)
+        if emoji_id <= 0:
+            emoji_id = 30
         return {
             "message_id": message_id,
-            "emoji": self.cfg.satori_processing_emoji or self._PROCESSING_EMOJI,
+            # Satori reaction 参数使用 emoji 字段，这里固定传 QQ 表情 id（字符串形式）。
+            "emoji": str(emoji_id),
+            "emoji_id": emoji_id,
             "route": route,
         }
 

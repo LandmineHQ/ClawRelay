@@ -676,31 +676,38 @@ class OpenClawGatewayMixin:
         command_text: str,
     ) -> tuple[str | None, str | None]:
         timeout = float(self.cfg.openclaw_timeout_sec)
+        # 新版 Gateway `send` 参数模式：to/message/idempotencyKey。
+        # 某些部署不支持在 sessionKey 上直接 send，此时回退到 chat.send('/new')。
         params: dict[str, Any] = {
-            "sessionKey": session_key,
-            "text": command_text,
-            "args": {
-                # Gateway `send` 才会按命令语义解析 `/new`。
-                "detectCommand": True,
-                "deliver": True,
-                "waitForResponse": False,
-            },
+            "to": session_key,
+            "message": command_text,
+            "idempotencyKey": str(uuid.uuid4()),
         }
         logging.info("OpenClaw send(command) via=%s key=%s text=%s", ws_url, session_key, command_text)
-        payload = await self._gateway_shared_request(
-            ws_url,
-            "send",
-            params,
-            timeout_sec=min(20.0, timeout),
-        )
-        run_id_value = payload.get("runId")
-        run_id = str(run_id_value).strip() if isinstance(run_id_value, str) else ""
-        if run_id:
-            return run_id, None
-        text = self._extract_text_from_chat_payload(payload)
-        if text:
-            return None, text
-        return None, None
+        try:
+            payload = await self._gateway_shared_request(
+                ws_url,
+                "send",
+                params,
+                timeout_sec=min(20.0, timeout),
+            )
+            run_id_value = payload.get("runId")
+            run_id = str(run_id_value).strip() if isinstance(run_id_value, str) else ""
+            if run_id:
+                return run_id, None
+            text = self._extract_text_from_chat_payload(payload)
+            if text:
+                return None, text
+        except Exception as exc:  # noqa: BLE001
+            logging.warning(
+                "OpenClaw send(command) rejected, fallback to chat.send: key=%s via=%s err=%s",
+                session_key,
+                ws_url,
+                exc,
+            )
+
+        # 回退：通过 chat.send 提交命令文本（/new），由网关命令触发器处理。
+        return await self._submit_openclaw_once(ws_url, session_key, command_text, [])
 
     async def _trigger_openclaw_command(
         self, session_key: str, command_text: str

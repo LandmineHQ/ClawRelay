@@ -27,7 +27,7 @@ class Config:
     satori_token: str = os.getenv("SATORI_TOKEN", "")
     satori_platform: str = os.getenv("SATORI_PLATFORM", "chronocat")
     satori_self_id: str = os.getenv("SATORI_SELF_ID", os.getenv("BOT_SELF_QQ", ""))
-    satori_processing_emoji: str = os.getenv("SATORI_PROCESSING_EMOJI", "奋斗")
+    satori_processing_emoji_id: int = env_int("SATORI_PROCESSING_EMOJI_ID", 30)
 
     openclaw_ws_url: str = os.getenv("OPENCLAW_WS_URL", "ws://127.0.0.1:18789")
     openclaw_gateway_token: str = os.getenv(

@@ -36,7 +36,7 @@ uv run start
 - `SATORI_TOKEN`：Satori token（默认沿用你原有 token，可覆盖）
 - `SATORI_PLATFORM`：默认 `chronocat`
 - `SATORI_SELF_ID`：可选，机器人账号 ID
-- `SATORI_PROCESSING_EMOJI`：处理中反应表情，默认 `奋斗`
+- `SATORI_PROCESSING_EMOJI_ID`：处理中表态 id，默认 `30`（QQ 奋斗）
 - `OPENCLAW_WS_URL`：默认 `ws://127.0.0.1:18789`
 - `OPENCLAW_GATEWAY_TOKEN`：Gateway token（默认写入了当前机器 OpenClaw 配置中的 token，可覆盖）
 - `OPENCLAW_GATEWAY_PASSWORD`：Gateway password（如你使用密码鉴权）

@@ -129,6 +129,38 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
     def _normalize_user_id(value: Any) -> str:
         return str(value or "").strip()
 
+    @staticmethod
+    def _event_log_brief(event: dict[str, Any]) -> dict[str, Any]:
+        raw_msg = str(event.get("raw_message") or "").strip()
+        return {
+            "message_id": str(event.get("message_id") or "").strip(),
+            "message_type": str(event.get("message_type") or "").strip(),
+            "user_id": str(event.get("user_id") or "").strip(),
+            "group_id": str(event.get("group_id") or "").strip(),
+            "session_self_id": str(event.get("self_id") or "").strip(),
+            "raw_message": raw_msg[:240] + ("…" if len(raw_msg) > 240 else ""),
+            "has_images": "[CQ:image" in raw_msg or "[图片:" in raw_msg,
+        }
+
+    @staticmethod
+    def _route_log_brief(event: dict[str, Any]) -> dict[str, Any]:
+        route_raw = event.get("_satori_route")
+        route = route_raw if isinstance(route_raw, dict) else {}
+        return {
+            "platform": str(route.get("platform") or "").strip(),
+            "self_id": str(route.get("self_id") or "").strip(),
+            "channel_id": str(route.get("channel_id") or "").strip(),
+            "guild_id": str(route.get("guild_id") or "").strip(),
+            "message_type": str(event.get("message_type") or "").strip(),
+        }
+
+    @staticmethod
+    def _preview_text(text: str, max_len: int = 280) -> str:
+        raw = re.sub(r"\s+", " ", (text or "")).strip()
+        if len(raw) <= max_len:
+            return raw
+        return raw[: max_len - 1].rstrip() + "…"
+
     def _ops_store_path(self) -> str:
         path = self.cfg.op_store_path.strip()
         return path or "./.bridge_ops.json"
@@ -432,7 +464,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             if route_event is None:
                 log_io(
                     source="gateway",
-                    direction="gateway -> satori",
+                    direction="gateway -> bridge",
                     content="丢弃回复：未绑定路由",
                     received={"run_id": run_id, "payload": initial_payload},
                     sent=None,
@@ -442,20 +474,24 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             if not reply:
                 log_io(
                     source="gateway",
-                    direction="gateway -> satori",
+                    direction="gateway -> bridge",
                     content="丢弃回复：文本为空",
                     received={"run_id": run_id, "payload": initial_payload},
-                    sent={"route_event": route_event},
+                    sent=None,
                     level=logging.WARNING,
                 )
                 return
             outbound_text = self._merge_hint_reply(reply_hint, reply)
             log_io(
-                source="gateway",
-                direction="gateway -> satori",
-                content="转发回复",
-                received={"run_id": run_id, "payload": initial_payload, "reply": reply},
-                sent={"route_event": route_event, "message": outbound_text},
+                source="bridge",
+                direction="bridge -> satori",
+                content="发送回复",
+                received=None,
+                sent={
+                    "run_id": run_id,
+                    "route": self._route_log_brief(route_event),
+                    "message": outbound_text,
+                },
             )
             await self._send_onebot_reply(route_event, outbound_text)
         except Exception as exc:  # noqa: BLE001
@@ -478,11 +514,15 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 try:
                     error_text = self._openclaw_error_reply(exc)
                     log_io(
-                        source="gateway",
-                        direction="gateway -> satori",
+                        source="bridge",
+                        direction="bridge -> satori",
                         content="转发错误回复",
-                        received={"run_id": run_id, "payload": initial_payload, "error": str(exc)},
-                        sent={"route_event": route_event, "message": error_text},
+                        received=None,
+                        sent={
+                            "run_id": run_id,
+                            "route": self._route_log_brief(route_event),
+                            "message": error_text,
+                        },
                         level=logging.WARNING,
                     )
                     await self._send_onebot_reply(route_event, error_text)
@@ -499,6 +539,19 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
     ) -> None:
         if run_id in self.gateway_relay_runs:
             return
+        log_io(
+            source="gateway",
+            direction="gateway -> bridge",
+            content="接收运行事件",
+            received={
+                "run_id": run_id,
+                "state": payload.get("state"),
+                "event": payload.get("event"),
+                "sessionKey": payload.get("sessionKey"),
+                "seq": payload.get("seq"),
+            },
+            sent=None,
+        )
         self.gateway_relay_runs.add(run_id)
         task = asyncio.create_task(
             self._relay_unsolicited_completion_to_onebot(run_id, dict(payload), ws_url)
@@ -685,14 +738,20 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         try:
             log_io(
                 source="satori",
-                direction="satori -> gateway",
-                content="触发新会话命令",
-                received=event,
+                direction="satori -> bridge",
+                content="接收 /new 指令",
+                received=self._event_log_brief(event),
+                sent=None,
+            )
+            log_io(
+                source="bridge",
+                direction="bridge -> gateway",
+                content="转发 /new 指令",
+                received=None,
                 sent={
                     "method": "send",
-                    "sessionKey": session_key,
-                    "text": "/new",
-                    "args": {"detectCommand": True, "deliver": True},
+                    "to": session_key,
+                    "message": "/new",
                 },
             )
             ws_url, run_id, instant_text = await self._trigger_openclaw_command(
@@ -767,14 +826,10 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         async with self.sem:
             log_io(
                 source="satori",
-                direction="satori -> gateway",
-                content="接收并准备转发消息",
-                received=event,
-                sent={
-                    "session_key": session_key,
-                    "prompt_text": prompt_text,
-                    "image_candidates": len(image_candidates),
-                },
+                direction="satori -> bridge",
+                content="接收消息事件",
+                received=self._event_log_brief(event),
+                sent=None,
             )
 
             processing_marker: dict[str, Any] | None = None
@@ -782,14 +837,14 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 processing_marker = await self._mark_processing_emoji(event)
                 attachments = await self._build_image_attachments(image_candidates)
                 log_io(
-                    source="satori",
-                    direction="satori -> gateway",
+                    source="bridge",
+                    direction="bridge -> gateway",
                     content="附件构建完成并发送 chat.send",
-                    received=event,
+                    received=None,
                     sent={
                         "method": "chat.send",
                         "sessionKey": session_key,
-                        "message": prompt_text,
+                        "message_preview": self._preview_text(prompt_text),
                         "candidate_images": len(image_candidates),
                         "attachments": len(attachments),
                     },
@@ -811,15 +866,16 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 )
                 if instant_text:
                     log_io(
-                        source="gateway",
-                        direction="gateway -> satori",
-                        content="即时回复转发",
-                        received={
+                        source="bridge",
+                        direction="bridge -> satori",
+                        content="发送即时回复",
+                        received=None,
+                        sent={
                             "run_id": run_id,
                             "session_key": session_key,
-                            "instant_text": instant_text,
+                            "route": self._route_log_brief(event),
+                            "message": self._merge_hint_reply(reply_hint, instant_text),
                         },
-                        sent={"event": event, "message": self._merge_hint_reply(reply_hint, instant_text)},
                     )
                     await self._send_onebot_reply(
                         event, self._merge_hint_reply(reply_hint, instant_text)
@@ -828,10 +884,10 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 if not run_id:
                     log_io(
                         source="gateway",
-                        direction="gateway -> satori",
+                        direction="gateway -> bridge",
                         content="chat.send 已受理但 ack 无 runId/text，等待异步事件",
                         received={"session_key": session_key, "ws_url": ws_url},
-                        sent={"event": event},
+                        sent=None,
                         level=logging.WARNING,
                     )
                     return
