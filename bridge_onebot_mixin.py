@@ -326,18 +326,35 @@ class OneBotMixin:
     def _format_observation_item(obs: PendingObservation) -> str:
         display = obs.normalized_text or "（无文本）"
         time_str = datetime.fromtimestamp(obs.ts).strftime("%H:%M:%S")
-        return (
-            f"- time: {time_str}\n"
-            f"  user_name: {obs.sender_name or 'unknown'}\n"
-            f"  user_id: {obs.sender_id or 'unknown'}\n"
-            f"  content: {display}"
-        )
+        reply_ids = ", ".join(obs.reply_ids) if obs.reply_ids else "null"
+        forward_ids = ", ".join(obs.forward_ids) if obs.forward_ids else "null"
+        lines = [
+            f"- time: {time_str}",
+            f"  user_name: {obs.sender_name or 'unknown'}",
+            f"  user_id: {obs.sender_id or 'unknown'}",
+            f"  content: {display}",
+            f"  reply_ids: {reply_ids}",
+            f"  forward_ids: {forward_ids}",
+        ]
+        if obs.reply_blocks:
+            lines.append("  reply_context:")
+            for idx, block in enumerate(obs.reply_blocks, start=1):
+                lines.append(f"    - block_{idx}:")
+                lines.extend([f"      {piece}" for piece in block.splitlines()])
+        if obs.forward_blocks:
+            lines.append("  forward_context:")
+            for idx, block in enumerate(obs.forward_blocks, start=1):
+                lines.append(f"    - block_{idx}:")
+                lines.extend([f"      {piece}" for piece in block.splitlines()])
+        return "\n".join(lines)
 
     def _record_observation(
-        self, event: dict[str, Any], session_key: str, normalized_text: str, images: list[MessageImage]
+        self, event: dict[str, Any], session_key: str, parsed: ParsedMessage
     ) -> None:
         sender_name = self._sender_name(event)
         sender_qq = str(event.get("user_id", "unknown"))
+        normalized_text = parsed.text.strip()
+        images = parsed.images
         ts_raw = event.get("time")
         try:
             ts = float(ts_raw) if ts_raw is not None else datetime.now().timestamp()
@@ -352,6 +369,10 @@ class OneBotMixin:
                 ts=ts,
                 sender_name=sender_name,
                 sender_id=sender_qq,
+                reply_ids=list(parsed.reply_ids),
+                forward_ids=list(parsed.forward_ids),
+                reply_blocks=list(parsed.reply_blocks),
+                forward_blocks=list(parsed.forward_blocks),
             )
         )
 
@@ -503,7 +524,9 @@ class OneBotMixin:
                 "- time: unknown\n"
                 "  user_name: unknown\n"
                 "  user_id: unknown\n"
-                f"  content: {latest_line.strip() or '（无文本）'}"
+                f"  content: {latest_line.strip() or '（无文本）'}\n"
+                "  reply_ids: null\n"
+                "  forward_ids: null"
             )
 
         history_lines = [self._format_observation_item(item) for item in history]
@@ -831,9 +854,101 @@ class OneBotMixin:
         return best
 
     async def _augment_parsed_message(self, event: dict[str, Any], parsed: ParsedMessage) -> ParsedMessage:
-        _ = event
-        # Satori 协议下不依赖 OneBot 的 get_msg/get_forward_msg 补查，直接使用事件原始内容。
-        return parsed
+        route = self._satori_route_from_event(event)
+        if route is None:
+            return parsed
+
+        self_qq = self._get_self_qq(event)
+        reply_blocks: list[str] = []
+        forward_blocks: list[str] = []
+        merged_images = list(parsed.images)
+
+        # 引用消息：按 message_id 拉取并结构化到上下文中。
+        for reply_id in parsed.reply_ids[:2]:
+            payload = {
+                "channel_id": route["channel_id"],
+                "message_id": reply_id,
+            }
+            data = await self._satori_action("message.get", payload, route, timeout_sec=8)
+            if not isinstance(data, dict):
+                reply_blocks.append(
+                    "[引用消息]\n"
+                    f"- message_id: {reply_id}\n"
+                    "- status: 无法拉取引用消息内容"
+                )
+                continue
+            block, images = self._build_satori_message_context_block("引用消息", reply_id, data, self_qq)
+            reply_blocks.append(block)
+            merged_images = self._merge_images(merged_images, images)
+
+        # 转发消息：优先按 id 尝试 message.get；若平台不支持则至少保留结构化 id。
+        for forward_id in parsed.forward_ids[:2]:
+            payload = {
+                "channel_id": route["channel_id"],
+                "message_id": forward_id,
+            }
+            data = await self._satori_action("message.get", payload, route, timeout_sec=8)
+            if isinstance(data, dict):
+                block, images = self._build_satori_message_context_block("转发消息", forward_id, data, self_qq)
+                forward_blocks.append(block)
+                merged_images = self._merge_images(merged_images, images)
+                continue
+            forward_blocks.append(
+                "[转发消息]\n"
+                f"- message_id: {forward_id}\n"
+                "- status: 当前平台不支持按该 id 拉取转发节点详情"
+            )
+
+        return ParsedMessage(
+            text=parsed.text,
+            mentioned=parsed.mentioned,
+            images=merged_images,
+            reply_ids=list(parsed.reply_ids),
+            forward_ids=list(parsed.forward_ids),
+            reply_blocks=reply_blocks,
+            forward_blocks=forward_blocks,
+        )
+
+    def _build_satori_message_context_block(
+        self, tag: str, message_id: str, payload: dict[str, Any], self_qq: str
+    ) -> tuple[str, list[MessageImage]]:
+        user_raw = payload.get("user")
+        user = user_raw if isinstance(user_raw, dict) else {}
+        member_raw = payload.get("member")
+        member = member_raw if isinstance(member_raw, dict) else {}
+        member_user_raw = member.get("user")
+        member_user = member_user_raw if isinstance(member_user_raw, dict) else {}
+        sender_id = str(
+            user.get("id")
+            or member_user.get("id")
+            or user.get("user_id")
+            or member_user.get("user_id")
+            or "unknown"
+        ).strip()
+        sender_name = str(
+            member.get("nick")
+            or member.get("name")
+            or user.get("name")
+            or user.get("nick")
+            or sender_id
+            or "unknown"
+        ).strip()
+        content = str(payload.get("content") or "").strip()
+        parser = getattr(self, "_satori_content_to_segments", None)
+        parsed = (
+            self._extract_message_from_payload(parser(content), self_qq)
+            if callable(parser)
+            else self._extract_message_from_payload(content, self_qq)
+        )
+        preview = self._truncate_text(self._compact_text(parsed.text or "（无文本）"), 300)
+        block = (
+            f"[{tag}]\n"
+            f"- message_id: {message_id}\n"
+            f"- user_name: {sender_name or 'unknown'}\n"
+            f"- user_id: {sender_id or 'unknown'}\n"
+            f"- content: {preview}"
+        )
+        return block, parsed.images
 
     async def _resolve_image_with_get_image(self, file_id: str) -> MessageImage | None:
         # OneBot v11: /get_image(file) -> { file, url, file_name, ... }

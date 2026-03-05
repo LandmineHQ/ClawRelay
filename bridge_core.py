@@ -1019,7 +1019,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             task.add_done_callback(self._discard_bg_task)
             return
 
-        self._record_observation(event, session_key, normalized_text, parsed.images)
+        self._record_observation(event, session_key, parsed)
         if not should_reply:
             logging.info(
                 "Satori group message observed only (not triggering reply): key=%s text=%s mentioned=%s",
@@ -1097,14 +1097,27 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         out: list[dict[str, Any]] = []
         tag_pattern = re.compile(r"<(/?)([A-Za-z][\w-]*)([^>]*)>")
         last = 0
+        quote_depth = 0
         for matched in tag_pattern.finditer(text):
             plain = unescape(text[last : matched.start()])
-            if plain:
+            if plain and quote_depth == 0:
                 out.append({"type": "text", "data": {"text": plain}})
             last = matched.end()
-            if matched.group(1) == "/":
-                continue
+            is_close = matched.group(1) == "/"
             tag_name = matched.group(2).lower()
+            if tag_name == "quote":
+                if is_close:
+                    if quote_depth > 0:
+                        quote_depth -= 1
+                    continue
+                attrs = cls._satori_parse_tag_attrs(matched.group(3) or "")
+                msg_id = attrs.get("id") or ""
+                if msg_id and quote_depth == 0:
+                    out.append({"type": "reply", "data": {"id": msg_id}})
+                quote_depth += 1
+                continue
+            if is_close or quote_depth > 0:
+                continue
             attrs = cls._satori_parse_tag_attrs(matched.group(3) or "")
             if tag_name == "at":
                 target = attrs.get("id") or attrs.get("qq") or attrs.get("type")
@@ -1116,13 +1129,8 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 if src:
                     out.append({"type": "image", "data": {"url": src, "file": ""}})
                 continue
-            if tag_name == "quote":
-                msg_id = attrs.get("id") or ""
-                if msg_id:
-                    out.append({"type": "reply", "data": {"id": msg_id}})
-                continue
         tail = unescape(text[last:])
-        if tail:
+        if tail and quote_depth == 0:
             out.append({"type": "text", "data": {"text": tail}})
         return out
 

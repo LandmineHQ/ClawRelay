@@ -14,6 +14,8 @@ class ParsedMessage:
     images: list[MessageImage]
     reply_ids: list[str] = field(default_factory=list)
     forward_ids: list[str] = field(default_factory=list)
+    reply_blocks: list[str] = field(default_factory=list)
+    forward_blocks: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -24,6 +26,10 @@ class PendingObservation:
     ts: float
     sender_name: str = ""
     sender_id: str = ""
+    reply_ids: list[str] = field(default_factory=list)
+    forward_ids: list[str] = field(default_factory=list)
+    reply_blocks: list[str] = field(default_factory=list)
+    forward_blocks: list[str] = field(default_factory=list)
 
 
 @dataclass
