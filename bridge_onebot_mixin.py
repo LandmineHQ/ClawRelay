@@ -301,6 +301,7 @@ class OneBotMixin:
             f"- time: {time_str}",
             f"  user_name: {obs.sender_name or 'unknown'}",
             f"  user_id: {obs.sender_id or 'unknown'}",
+            f"  message_id: {obs.message_id or 'unknown'}",
             f"  content: {display}",
             f"  reply_ids: {reply_ids}",
             f"  forward_ids: {forward_ids}",
@@ -338,6 +339,7 @@ class OneBotMixin:
                 ts=ts,
                 sender_name=sender_name,
                 sender_id=sender_qq,
+                message_id=str(event.get("message_id") or "").strip(),
                 reply_ids=list(parsed.reply_ids),
                 forward_ids=list(parsed.forward_ids),
                 reply_blocks=list(parsed.reply_blocks),
@@ -495,6 +497,7 @@ class OneBotMixin:
         history = recent[:-1] if len(recent) > 1 else []
         latest_obs = recent[-1] if recent else None
         current_sender_id = latest_obs.sender_id if latest_obs is not None else "unknown"
+        current_message_id = latest_obs.message_id if latest_obs is not None else "unknown"
         if latest_obs is not None:
             current_block = self._format_observation_item(latest_obs)
         else:
@@ -502,6 +505,7 @@ class OneBotMixin:
                 "- time: unknown\n"
                 "  user_name: unknown\n"
                 "  user_id: unknown\n"
+                "  message_id: unknown\n"
                 f"  content: {latest_line.strip() or '（无文本）'}\n"
                 "  reply_ids: null\n"
                 "  forward_ids: null"
@@ -515,12 +519,13 @@ class OneBotMixin:
             "规则：\n"
             "1) user_name 可能包含数字（例如“我是1354987”），这不是 QQ 号。\n"
             "2) 只能使用 user_id 作为 QQ 号；如需@，仅可输出 `<at id=\"<user_id>\"/>`。\n"
-            "3) 默认@发送者，除非被要求不@发送者。\n"
+            "3) 默认同时@当前发送者并引用其消息：优先在回复开头使用 `<quote id=\"<message_id>\"/>` 引用当前待回复消息，再使用 `<at id=\"<user_id>\"/>`；除非被明确要求不@或不引用。若无法同时做到，可以只@或只引用。\n"
             f"4) 当前待回复消息发送者 user_id: {current_sender_id}\n"
-            f"5) 当前机器人 user_id: {bot_id}；当 `<at id=\"{bot_id}\"/>` 出现时，表示在@你。\n"
-            "6) 回复内容使用 Satori message content 格式；可使用 `<at/>`、`<quote/>`、`<img/>` 等元素与文本混排。\n"
-            "7) 需要引用时，可在回复开头使用 `<quote id=\"<message_id>\"/>`；`message_id` 必须来自上下文已有 id（如 message_id/reply_ids/forward_ids），禁止编造。\n"
-            "8) 默认保持简洁；仅当用户明确要求 Markdown 时，才使用 Markdown。"
+            f"5) 当前待回复消息 message_id: {current_message_id}\n"
+            f"6) 当前机器人 user_id: {bot_id}；当 `<at id=\"{bot_id}\"/>` 出现时，表示在@你。\n"
+            "7) 回复内容使用 Satori message content 格式；可使用 `<at/>`、`<quote/>`、`<img/>` 等元素与文本混排。\n"
+            "8) 仅可使用上下文中出现过的 message_id（如当前消息 message_id/reply_ids/forward_ids）进行引用，禁止编造。\n"
+            "9) 默认保持简洁；仅当用户明确要求 Markdown 时，才使用 Markdown。"
         )
         if not include_guidance:
             return (
