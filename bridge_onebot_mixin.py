@@ -845,50 +845,27 @@ class OneBotMixin:
 
         parts: list[str] = ["<message forward>"]
         node_count = 0
-        max_nodes = 30
-        for raw_node in messages[:max_nodes]:
+        for raw_node in messages:
             if not isinstance(raw_node, dict):
                 continue
             node_count += 1
-            sender_raw = raw_node.get("sender")
-            sender = sender_raw if isinstance(sender_raw, dict) else {}
-            author_id = str(
-                sender.get("user_id") or sender.get("id") or sender.get("qq") or ""
-            ).strip()
-            author_name = str(
-                sender.get("nickname") or sender.get("card") or sender.get("name") or ""
-            ).strip()
-            author_avatar = str(sender.get("avatar") or "").strip()
-
             content_payload = raw_node.get("content")
             if content_payload is None:
                 content_payload = raw_node.get("message")
             rendered = self._onebot_payload_to_satori_content(content_payload)
             node_msg_id = str(raw_node.get("message_id") or raw_node.get("id") or "").strip()
-
-            if not rendered:
-                if node_msg_id:
-                    parts.append(f'<message id="{escape(node_msg_id, quote=True)}"/>')
-                continue
-
-            parts.append("<message>")
-            if author_id or author_name or author_avatar:
-                attrs: list[str] = []
-                if author_id:
-                    attrs.append(f'id="{escape(author_id, quote=True)}"')
-                if author_name:
-                    attrs.append(f'name="{escape(author_name, quote=True)}"')
-                if author_avatar:
-                    attrs.append(f'avatar="{escape(author_avatar, quote=True)}"')
-                parts.append(f"<author {' '.join(attrs)}/>")
-            parts.append(rendered)
+            msg_open = (
+                f'<message id="{escape(node_msg_id, quote=True)}">'
+                if node_msg_id
+                else "<message>"
+            )
+            parts.append(msg_open)
+            if rendered:
+                parts.append(rendered)
             parts.append("</message>")
 
         if node_count <= 0:
             return None
-        remaining = len(messages) - min(len(messages), max_nodes)
-        if remaining > 0:
-            parts.append(f"<message>{escape(f'其余 {remaining} 条转发节点已省略')}</message>")
         parts.append("</message>")
         content = "".join(parts)
         return {
@@ -914,6 +891,11 @@ class OneBotMixin:
         if isinstance(data, dict):
             return data, False
 
+        logging.info(
+            "Satori message.get fallback triggered: channel_id=%s message_id=%s -> internal/onebot11/get_forward_msg",
+            route.get("channel_id"),
+            message_id,
+        )
         internal_raw = await self._satori_action(
             "internal/onebot11/get_forward_msg",
             {"message_id": message_id},
@@ -921,6 +903,11 @@ class OneBotMixin:
             timeout_sec=10,
         )
         if not isinstance(internal_raw, dict):
+            logging.warning(
+                "Satori message.get fallback failed: internal response invalid, channel_id=%s message_id=%s",
+                route.get("channel_id"),
+                message_id,
+            )
             return None, False
 
         payload_candidates: list[dict[str, Any]] = []
@@ -934,7 +921,18 @@ class OneBotMixin:
                 continue
             synthesized = self._build_satori_forward_message_from_internal(message_id, candidate)
             if isinstance(synthesized, dict):
+                logging.info(
+                    "Satori message.get fallback hit: channel_id=%s message_id=%s forward_nodes=%s",
+                    route.get("channel_id"),
+                    message_id,
+                    len(msg_raw),
+                )
                 return synthesized, True
+        logging.warning(
+            "Satori message.get fallback failed: no forward messages, channel_id=%s message_id=%s",
+            route.get("channel_id"),
+            message_id,
+        )
         return None, False
 
     async def _augment_parsed_message(self, event: dict[str, Any], parsed: ParsedMessage) -> ParsedMessage:
@@ -952,9 +950,7 @@ class OneBotMixin:
 
         # 引用消息：按 message_id 拉取并结构化到上下文中。
         for reply_id in parsed.reply_ids[:2]:
-            data, used_internal_fallback = await self._satori_message_get_with_forward_fallback(
-                route, reply_id
-            )
+            data, _ = await self._satori_message_get_with_forward_fallback(route, reply_id)
             if not isinstance(data, dict):
                 if history_index is None:
                     history_index = await self._satori_history_message_index(route, limit=200)
@@ -966,7 +962,7 @@ class OneBotMixin:
                         history_data,
                         self_qq,
                     )
-                    reply_blocks.append(block + "\n- status: 使用 message.list 历史回退")
+                    reply_blocks.append(block)
                     merged_images = self._merge_images(merged_images, images)
                     continue
                 fallback = quote_fallback_map.get(reply_id)
@@ -975,7 +971,6 @@ class OneBotMixin:
                         "引用消息",
                         reply_id,
                         fallback,
-                        status="使用事件中的 quote 内容回退",
                     )
                     reply_blocks.append(block)
                     merged_images = self._merge_images(merged_images, images)
@@ -988,20 +983,14 @@ class OneBotMixin:
                 reply_blocks.append("[引用消息]\n" f"- message_id: {reply_id}\n" f"- status: {status}")
                 continue
             block, images = self._build_satori_message_context_block("引用消息", reply_id, data, self_qq)
-            if used_internal_fallback:
-                block = block + "\n- status: message.get 失败，使用 internal/onebot11/get_forward_msg 回退"
             reply_blocks.append(block)
             merged_images = self._merge_images(merged_images, images)
 
         # 转发消息：优先按 id 尝试 message.get；若平台不支持则至少保留结构化 id。
         for forward_id in parsed.forward_ids[:2]:
-            data, used_internal_fallback = await self._satori_message_get_with_forward_fallback(
-                route, forward_id
-            )
+            data, _ = await self._satori_message_get_with_forward_fallback(route, forward_id)
             if isinstance(data, dict):
                 block, images = self._build_satori_message_context_block("转发消息", forward_id, data, self_qq)
-                if used_internal_fallback:
-                    block = block + "\n- status: message.get 失败，使用 internal/onebot11/get_forward_msg 回退"
                 forward_blocks.append(block)
                 merged_images = self._merge_images(merged_images, images)
                 continue
@@ -1015,7 +1004,7 @@ class OneBotMixin:
                     history_data,
                     self_qq,
                 )
-                forward_blocks.append(block + "\n- status: 使用 message.list 历史回退")
+                forward_blocks.append(block)
                 merged_images = self._merge_images(merged_images, images)
                 continue
             fallback = quote_fallback_map.get(forward_id)
@@ -1024,7 +1013,6 @@ class OneBotMixin:
                     "转发消息",
                     forward_id,
                     fallback,
-                    status="使用事件中的 quote 内容回退",
                 )
                 forward_blocks.append(block)
                 merged_images = self._merge_images(merged_images, images)
