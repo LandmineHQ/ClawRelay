@@ -653,16 +653,15 @@ class OneBotMixin:
         payload = {
             "channel_id": marker["route"]["channel_id"],
             "message_id": marker["message_id"],
-            "emoji": marker["emoji"],
+            "emoji_id": marker["emoji_id"],
         }
         result = await self._satori_action("reaction.create", payload, marker["route"], timeout_sec=8)
         if result is None:
             self.satori_reaction_disabled_until = now + 600
             self.satori_reaction_disable_reason = "reaction.create failed (platform not supported or broken)"
             logging.warning(
-                "Failed to set processing emoji via reaction.create: message_id=%s emoji=%s emoji_id=%s; disable reaction marking for 600s",
+                "Failed to set processing emoji via reaction.create: message_id=%s emoji_id=%s; disable reaction marking for 600s",
                 marker.get("message_id"),
-                marker.get("emoji"),
                 marker.get("emoji_id"),
             )
             return None
@@ -672,17 +671,17 @@ class OneBotMixin:
         if marker is None:
             return
         message_id = marker.get("message_id")
-        emoji = marker.get("emoji")
+        emoji_id = marker.get("emoji_id")
         route = marker.get("route")
-        if message_id is None or emoji is None or not isinstance(route, dict):
+        if message_id is None or emoji_id is None or not isinstance(route, dict):
             return
-        marker_key = f"{message_id}:{emoji}"
+        marker_key = f"{message_id}:{emoji_id}"
         if marker_key in self.cleared_processing_marker_set:
             return
         payload = {
             "channel_id": route.get("channel_id"),
             "message_id": message_id,
-            "emoji": emoji,
+            "emoji_id": str(emoji_id),
         }
         result = await self._satori_action("reaction.delete", payload, route, timeout_sec=8)
         if result is not None:
@@ -696,10 +695,9 @@ class OneBotMixin:
             return
 
         logging.warning(
-            "Failed to clear processing emoji via reaction.delete: message_id=%s emoji=%s emoji_id=%s",
+            "Failed to clear processing emoji via reaction.delete: message_id=%s emoji_id=%s",
             message_id,
-            emoji,
-            marker.get("emoji_id"),
+            emoji_id,
         )
         # 部分实现在重复状态下会返回 failed，但视觉结果可能已生效，这里仍做去重以免重复刷接口。
         self.cleared_processing_marker_set.add(marker_key)
@@ -724,9 +722,8 @@ class OneBotMixin:
             emoji_id = 30
         return {
             "message_id": message_id,
-            # Satori reaction 参数使用 emoji 字段，这里固定传 QQ 表情 id（字符串形式）。
-            "emoji": str(emoji_id),
-            "emoji_id": emoji_id,
+            # LLOneBot reaction.create/delete 需要 emoji_id（字符串）。
+            "emoji_id": str(emoji_id),
             "route": route,
         }
 
