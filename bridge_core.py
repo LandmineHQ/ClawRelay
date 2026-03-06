@@ -69,6 +69,10 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         self.gateway_pending_reqs: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self.gateway_run_payloads: defaultdict[str, deque[dict[str, Any]]] = defaultdict(deque)
         self.gateway_run_waiters: dict[str, asyncio.Future[None]] = {}
+        self.gateway_session_run_claim_waiters: defaultdict[
+            str,
+            list[tuple[asyncio.Future[tuple[str, dict[str, Any], str]], set[str]]],
+        ] = defaultdict(list)
         self.gateway_relay_runs: set[str] = set()
         self.gateway_run_preferred_targets: dict[str, dict[str, Any]] = {}
         self.gateway_run_processing_markers: dict[str, dict[str, Any]] = {}
@@ -570,27 +574,20 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         return "; ".join(parts)
 
     @classmethod
-    def _broken_image_retry_prompt(cls, broken_images: list[dict[str, str]]) -> str:
-        lines = [
-            "系统检查发现你上一条准备发送到 Satori 的回复中包含无法访问的图片 URL，因此消息发送失败。",
-            "以下图片不可访问：",
-        ]
-        for item in broken_images:
-            url = str(item.get("url") or "").strip()
-            reason = str(item.get("reason") or "").strip() or "unknown"
-            if url:
-                lines.append(f"- {url} ({reason})")
-        lines.extend(
-            [
-                "",
-                "请基于刚才同一轮对话重新生成一条完整回复，并严格遵守：",
-                "1. 不要继续使用上述失效图片 URL。",
-                "2. 只有在图片 URL 可直接访问时才输出 `<img src=\"...\"/>`。",
-                "3. 如果无法提供可访问图片，就不要输出图片，改为纯文本说明。",
-                "4. 只输出最终要发送给 Satori 的完整回复内容，不要附加解释。",
-            ]
+    def _broken_image_retry_prompt(
+        cls,
+        broken_images: list[dict[str, str]],
+        failed_reply: str,
+    ) -> str:
+        _ = broken_images
+        reply_content = failed_reply.strip() or "（空）"
+        return (
+            "下面这条待发送回复中的图片无法访问，请针对这条具体回复自行处理图片问题并重新生成最终回复。"
+            "\n出错的待发送回复内容如下："
+            f"\n```xml\n{reply_content}\n```"
+            "\n如果无法提供可访问图片，就不要输出图片，改为纯文本。"
+            "\n只输出最终要发送给 Satori 的完整回复内容，不要附加解释。"
         )
-        return "\n".join(lines)
 
     async def _prepare_gateway_reply_for_satori(
         self,
@@ -604,6 +601,8 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         current_reply = reply_text.strip()
         hint_text = reply_hint.strip()
         current_ws_url = ws_url
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(self.cfg.openclaw_timeout_sec)
 
         for attempt in range(2):
             outbound_text = self._merge_hint_reply(hint_text, current_reply)
@@ -631,7 +630,10 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             if attempt >= 1:
                 raise RuntimeError(f"以下图片无法访问：{detail}")
 
-            retry_prompt = self._broken_image_retry_prompt(broken_images)
+            retry_prompt = self._broken_image_retry_prompt(
+                broken_images,
+                outbound_text,
+            )
             log_io(
                 source="bridge",
                 direction="bridge -> gateway",
@@ -662,7 +664,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                         run_id=retry_run_id,
                         session_key=session_key,
                         ws_url=retry_ws_url,
-                        timeout_sec=float(self.cfg.openclaw_timeout_sec),
+                        timeout_sec=max(0.1, deadline - loop.time()),
                         initial_payload={
                             "runId": retry_run_id,
                             "event": "bridge.reply_retry",
@@ -676,6 +678,15 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             finally:
                 if retry_run_id:
                     self.gateway_relay_runs.discard(retry_run_id)
+
+            if not current_reply:
+                followup_reply = await self._wait_for_session_followup_run(
+                    session_key=session_key,
+                    ws_url=current_ws_url,
+                    exclude_run_ids={run_id, retry_run_id or ""},
+                    timeout_sec=max(0.1, deadline - loop.time()),
+                )
+                current_reply = (followup_reply or "").strip()
 
             if not current_reply:
                 raise RuntimeError("图片重生成失败：gateway 返回空回复")

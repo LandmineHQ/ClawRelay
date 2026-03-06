@@ -27,12 +27,118 @@ class OpenClawGatewayMixin:
     gateway_pending_reqs: dict[str, asyncio.Future[dict[str, Any]]]
     gateway_run_payloads: defaultdict[str, deque[dict[str, Any]]]
     gateway_run_waiters: dict[str, asyncio.Future[None]]
+    gateway_relay_runs: set[str]
+    gateway_session_run_claim_waiters: defaultdict[
+        str,
+        list[tuple[asyncio.Future[tuple[str, dict[str, Any], str]], set[str]]],
+    ]
 
     async def _on_gateway_run_event(
         self, run_id: str, payload: dict[str, Any], ws_url: str
     ) -> None:
         # Optional hook for bridge-level routing/dispatch logic.
         return
+
+    @staticmethod
+    def _normalize_openclaw_session_key(session_key: str) -> str:
+        key = session_key.strip()
+        prefix = "agent:main:"
+        if key.startswith(prefix):
+            return key[len(prefix) :]
+        return key
+
+    def _claim_session_followup_run(
+        self,
+        session_key: str,
+        run_id: str,
+        payload: dict[str, Any],
+        ws_url: str,
+    ) -> bool:
+        key = self._normalize_openclaw_session_key(session_key)
+        if not key:
+            return False
+        waiters = self.gateway_session_run_claim_waiters.get(key)
+        if not waiters:
+            return False
+
+        remaining: list[
+            tuple[asyncio.Future[tuple[str, dict[str, Any], str]], set[str]]
+        ] = []
+        claimed = False
+        for fut, excluded_run_ids in waiters:
+            if fut.done():
+                continue
+            if run_id in excluded_run_ids:
+                remaining.append((fut, excluded_run_ids))
+                continue
+            if not claimed:
+                self.gateway_relay_runs.add(run_id)
+                fut.set_result((run_id, dict(payload), ws_url))
+                claimed = True
+                continue
+            remaining.append((fut, excluded_run_ids))
+
+        if remaining:
+            self.gateway_session_run_claim_waiters[key] = remaining
+        else:
+            self.gateway_session_run_claim_waiters.pop(key, None)
+        return claimed
+
+    async def _wait_for_session_followup_run(
+        self,
+        *,
+        session_key: str,
+        ws_url: str,
+        exclude_run_ids: set[str],
+        timeout_sec: float,
+    ) -> str | None:
+        key = self._normalize_openclaw_session_key(session_key)
+        if not key or timeout_sec <= 0:
+            return None
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_sec
+        excluded = {item for item in exclude_run_ids if item}
+
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return None
+
+            fut: asyncio.Future[tuple[str, dict[str, Any], str]] = loop.create_future()
+            waiter = (fut, set(excluded))
+            self.gateway_session_run_claim_waiters[key].append(waiter)
+            try:
+                followup_run_id, initial_payload, followup_ws_url = await asyncio.wait_for(
+                    fut,
+                    timeout=remaining,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                return None
+            finally:
+                current_waiters = self.gateway_session_run_claim_waiters.get(key)
+                if current_waiters:
+                    self.gateway_session_run_claim_waiters[key] = [
+                        item for item in current_waiters if item[0] is not fut
+                    ]
+                    if not self.gateway_session_run_claim_waiters[key]:
+                        self.gateway_session_run_claim_waiters.pop(key, None)
+
+            excluded.add(followup_run_id)
+            try:
+                reply = await self._wait_shared_run_result(
+                    run_id=followup_run_id,
+                    session_key=key,
+                    ws_url=followup_ws_url or ws_url,
+                    timeout_sec=max(0.1, deadline - loop.time()),
+                    initial_payload=initial_payload,
+                )
+            finally:
+                self.gateway_relay_runs.discard(followup_run_id)
+
+            normalized = (reply or "").strip()
+            if normalized:
+                return normalized
 
     @staticmethod
     def _to_json_dict(value: object) -> dict[str, Any] | None:
@@ -205,6 +311,11 @@ class OpenClawGatewayMixin:
                         if waiter is not None and not waiter.done():
                             waiter.set_result(None)
                         try:
+                            session_key = str(payload.get("sessionKey") or "").strip()
+                            if self._claim_session_followup_run(
+                                session_key, run_id, payload, ws_url
+                            ):
+                                continue
                             await self._on_gateway_run_event(run_id, payload, ws_url)
                         except Exception as exc:  # noqa: BLE001
                             logging.warning(
