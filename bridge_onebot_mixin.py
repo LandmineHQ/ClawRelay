@@ -172,6 +172,14 @@ class OneBotMixin:
             return "<img/>"
         return f'<img src="{escape(src, quote=True)}"/>'
 
+    def _remote_fetch_headers(self, url: str) -> dict[str, str]:
+        satori_host = urlparse(self.cfg.satori_http_base).netloc
+        headers: dict[str, str] = {"User-Agent": "Mozilla/5.0"}
+        token = self.cfg.satori_token.strip()
+        if satori_host and urlparse(url).netloc == satori_host and token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
     def _extract_message_from_payload(
         self, payload: Any, self_qq: str
     ) -> ParsedMessage:
@@ -1478,11 +1486,7 @@ class OneBotMixin:
 
     async def _download_image(self, url: str) -> tuple[bytes | None, str]:
         assert self.session is not None
-        satori_host = urlparse(self.cfg.satori_http_base).netloc
-        headers: dict[str, str] = {"User-Agent": "Mozilla/5.0"}
-        token = self.cfg.satori_token.strip()
-        if satori_host and urlparse(url).netloc == satori_host and token:
-            headers["Authorization"] = f"Bearer {token}"
+        headers = self._remote_fetch_headers(url)
 
         try:
             async with self.session.get(url, headers=headers) as resp:
@@ -1493,6 +1497,31 @@ class OneBotMixin:
                 return body, ctype
         except Exception:  # noqa: BLE001
             return None, ""
+
+    async def _probe_remote_image_url(self, url: str) -> str | None:
+        assert self.session is not None
+        normalized = url.strip()
+        if not normalized:
+            return "missing_url"
+        if not (normalized.startswith("http://") or normalized.startswith("https://")):
+            return "non_http_url"
+
+        headers = self._remote_fetch_headers(normalized)
+        try:
+            async with self.session.get(
+                normalized,
+                headers=headers,
+                allow_redirects=True,
+            ) as resp:
+                if resp.status >= 400:
+                    return f"HTTP {resp.status}"
+                content_type = str(resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                if content_type.startswith("text/"):
+                    return f"content-type={content_type}"
+                return None
+        except Exception as exc:  # noqa: BLE001
+            detail = str(exc).strip()
+            return detail or type(exc).__name__
 
     @staticmethod
     def _guess_image_mime(url: str, file_name: str, content_type: str) -> str:

@@ -541,6 +541,147 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         except Exception:  # noqa: BLE001
             logging.exception("relay.unsolicited status=empty_reply_clear_failed run_id=%s", run_id)
 
+    @classmethod
+    def _extract_satori_image_urls(cls, content: str) -> list[str]:
+        urls: list[str] = []
+        seen: set[str] = set()
+        for seg in cls._satori_content_to_segments(content):
+            if not isinstance(seg, dict):
+                continue
+            seg_type = str(seg.get("type") or "").strip().lower()
+            if seg_type not in {"img", "image"}:
+                continue
+            url = str(seg.get("src") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+        return urls
+
+    @staticmethod
+    def _broken_image_detail_text(broken_images: list[dict[str, str]]) -> str:
+        parts: list[str] = []
+        for item in broken_images:
+            url = str(item.get("url") or "").strip()
+            reason = str(item.get("reason") or "").strip()
+            if not url:
+                continue
+            parts.append(f"{url} ({reason or 'unknown'})")
+        return "; ".join(parts)
+
+    @classmethod
+    def _broken_image_retry_prompt(cls, broken_images: list[dict[str, str]]) -> str:
+        lines = [
+            "系统检查发现你上一条准备发送到 Satori 的回复中包含无法访问的图片 URL，因此消息发送失败。",
+            "以下图片不可访问：",
+        ]
+        for item in broken_images:
+            url = str(item.get("url") or "").strip()
+            reason = str(item.get("reason") or "").strip() or "unknown"
+            if url:
+                lines.append(f"- {url} ({reason})")
+        lines.extend(
+            [
+                "",
+                "请基于刚才同一轮对话重新生成一条完整回复，并严格遵守：",
+                "1. 不要继续使用上述失效图片 URL。",
+                "2. 只有在图片 URL 可直接访问时才输出 `<img src=\"...\"/>`。",
+                "3. 如果无法提供可访问图片，就不要输出图片，改为纯文本说明。",
+                "4. 只输出最终要发送给 Satori 的完整回复内容，不要附加解释。",
+            ]
+        )
+        return "\n".join(lines)
+
+    async def _prepare_gateway_reply_for_satori(
+        self,
+        *,
+        run_id: str,
+        session_key: str,
+        ws_url: str,
+        reply_hint: str,
+        reply_text: str,
+    ) -> str:
+        current_reply = reply_text.strip()
+        hint_text = reply_hint.strip()
+        current_ws_url = ws_url
+
+        for attempt in range(2):
+            outbound_text = self._merge_hint_reply(hint_text, current_reply)
+            image_urls = self._extract_satori_image_urls(outbound_text)
+            if not image_urls:
+                return outbound_text
+
+            broken_images: list[dict[str, str]] = []
+            for url in image_urls:
+                reason = await self._probe_remote_image_url(url)
+                if reason is None:
+                    continue
+                broken_images.append({"url": url, "reason": reason})
+
+            if not broken_images:
+                return outbound_text
+
+            detail = self._broken_image_detail_text(broken_images)
+            logging.warning(
+                "reply.image stage=probe status=failed run_id=%s attempt=%s bad=%s",
+                run_id,
+                attempt + 1,
+                detail,
+            )
+            if attempt >= 1:
+                raise RuntimeError(f"以下图片无法访问：{detail}")
+
+            retry_prompt = self._broken_image_retry_prompt(broken_images)
+            log_io(
+                source="bridge",
+                direction="bridge -> gateway",
+                content="请求重生成：回复图片不可访问",
+                received=None,
+                sent={
+                    "run_id": run_id,
+                    "session_key": session_key,
+                    "ws_url": current_ws_url,
+                    "bad_images": broken_images,
+                    "message": retry_prompt,
+                },
+                level=logging.WARNING,
+            )
+            retry_ws_url, retry_run_id, retry_text = await self._submit_openclaw(
+                session_key,
+                retry_prompt,
+                [],
+            )
+            current_ws_url = retry_ws_url
+            if retry_run_id:
+                self.gateway_relay_runs.add(retry_run_id)
+            try:
+                if retry_text:
+                    current_reply = retry_text.strip()
+                elif retry_run_id:
+                    retry_reply = await self._wait_shared_run_result(
+                        run_id=retry_run_id,
+                        session_key=session_key,
+                        ws_url=retry_ws_url,
+                        timeout_sec=float(self.cfg.openclaw_timeout_sec),
+                        initial_payload={
+                            "runId": retry_run_id,
+                            "event": "bridge.reply_retry",
+                            "sessionKey": session_key,
+                            "seq": 0,
+                        },
+                    )
+                    current_reply = (retry_reply or "").strip()
+                else:
+                    current_reply = ""
+            finally:
+                if retry_run_id:
+                    self.gateway_relay_runs.discard(retry_run_id)
+
+            if not current_reply:
+                raise RuntimeError("图片重生成失败：gateway 返回空回复")
+
+        return self._merge_hint_reply(hint_text, current_reply)
+
     async def _relay_unsolicited_completion_to_onebot(
         self,
         run_id: str,
@@ -604,7 +745,13 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 )
                 await self._notify_openclaw_empty_reply(run_id, route_event, initial_payload)
                 return
-            outbound_text = self._merge_hint_reply(reply_hint, reply)
+            outbound_text = await self._prepare_gateway_reply_for_satori(
+                run_id=run_id,
+                session_key=session_key,
+                ws_url=relay_ws_url,
+                reply_hint=reply_hint,
+                reply_text=reply,
+            )
             log_io(
                 source="bridge",
                 direction="bridge -> satori",
@@ -993,6 +1140,13 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                     attachments,
                 )
                 if instant_text:
+                    outbound_text = await self._prepare_gateway_reply_for_satori(
+                        run_id=run_id or "instant",
+                        session_key=session_key,
+                        ws_url=ws_url,
+                        reply_hint=reply_hint,
+                        reply_text=instant_text,
+                    )
                     log_io(
                         source="bridge",
                         direction="bridge -> satori",
@@ -1002,12 +1156,10 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                             "run_id": run_id,
                             "session_key": session_key,
                             "route": self._route_log_brief(event),
-                            "message": self._merge_hint_reply(reply_hint, instant_text),
+                            "message": outbound_text,
                         },
                     )
-                    await self._send_onebot_reply(
-                        event, self._merge_hint_reply(reply_hint, instant_text)
-                    )
+                    await self._send_onebot_reply(event, outbound_text)
                     return
                 if not run_id:
                     log_io(
