@@ -17,6 +17,11 @@ from bridge_onebot_mixin import OneBotMixin
 from bridge_openclaw_mixin import OpenClawGatewayMixin
 
 try:
+    from aiohttp_socks import ProxyConnector
+except ModuleNotFoundError:
+    ProxyConnector = None
+
+try:
     from bridge_logging import log_io
 except ModuleNotFoundError:
     def log_io(
@@ -57,6 +62,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.session: aiohttp.ClientSession | None = None
+        self.media_session: aiohttp.ClientSession | None = None
         self.sem = asyncio.Semaphore(max(1, self.cfg.max_concurrency))
         self.bg_tasks: set[asyncio.Task[Any]] = set()
         self.seen_ids: deque[str] = deque(maxlen=2000)
@@ -1385,6 +1391,13 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             await self._close_shared_gateway()
         except Exception as exc:  # noqa: BLE001
             logging.warning("runtime.shutdown stage=close_gateway status=failed err=%s", exc)
+        media_session = self.media_session
+        self.media_session = None
+        if media_session is not None and not media_session.closed:
+            try:
+                await media_session.close()
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("runtime.shutdown stage=close_media_session status=failed err=%s", exc)
 
     async def _satori_ping_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         try:
@@ -1627,6 +1640,19 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
             self.session = session
+            proxy_url = self.cfg.bridge_proxy_url.strip()
+            if proxy_url:
+                if ProxyConnector is None:
+                    logging.warning(
+                        "media.proxy status=disabled reason=missing_aiohttp_socks proxy=%s",
+                        proxy_url,
+                    )
+                else:
+                    self.media_session = aiohttp.ClientSession(
+                        timeout=timeout,
+                        connector=ProxyConnector.from_url(proxy_url),
+                    )
+                    logging.info("media.proxy status=enabled proxy=%s", proxy_url)
             try:
                 while True:
                     try:
@@ -1758,3 +1784,4 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             finally:
                 await self._shutdown_runtime()
                 self.session = None
+                self.media_session = None

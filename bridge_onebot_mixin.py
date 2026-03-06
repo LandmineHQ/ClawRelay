@@ -18,6 +18,7 @@ from bridge_models import MessageImage, ParsedMessage, PendingObservation
 class OneBotMixin:
     cfg: Config
     session: aiohttp.ClientSession | None
+    media_session: aiohttp.ClientSession | None
     pending_context: dict[str, deque[PendingObservation]]
     seen_ids: deque[str]
     seen_set: set[str]
@@ -730,6 +731,7 @@ current_message
             if uid and not self._contains_satori_at_user(outgoing, uid):
                 outgoing = f'<at id="{uid}"/> {outgoing}'
         outgoing = self._normalize_outgoing_at_spacing(outgoing).strip()
+        outgoing = await self._inline_satori_image_data_urls(outgoing)
         payload = {
             "channel_id": route["channel_id"],
             "content": outgoing,
@@ -1580,11 +1582,12 @@ current_message
         return block, parsed.images
 
     async def _download_image(self, url: str) -> tuple[bytes | None, str]:
-        assert self.session is not None
+        session = self.media_session or self.session
+        assert session is not None
         headers = self._remote_fetch_headers(url)
 
         try:
-            async with self.session.get(url, headers=headers) as resp:
+            async with session.get(url, headers=headers) as resp:
                 if resp.status >= 400:
                     return None, ""
                 body = await resp.read()
@@ -1594,7 +1597,8 @@ current_message
             return None, ""
 
     async def _probe_remote_image_url(self, url: str) -> str | None:
-        assert self.session is not None
+        session = self.media_session or self.session
+        assert session is not None
         normalized = url.strip()
         if not normalized:
             return "missing_url"
@@ -1603,7 +1607,7 @@ current_message
 
         headers = self._remote_fetch_headers(normalized)
         try:
-            async with self.session.get(
+            async with session.get(
                 normalized,
                 headers=headers,
                 allow_redirects=True,
@@ -1617,6 +1621,81 @@ current_message
         except Exception as exc:  # noqa: BLE001
             detail = str(exc).strip()
             return detail or type(exc).__name__
+
+    async def _inline_satori_image_data_urls(self, content: str) -> str:
+        text = (content or "").strip()
+        if not text:
+            return ""
+
+        parse_attrs = getattr(self, "_satori_parse_tag_attrs", None)
+        if not callable(parse_attrs):
+            return text
+
+        max_bytes = max(1024 * 1024, self.cfg.max_image_download_bytes)
+        pattern = re.compile(r"<(img|image)\b([^>]*)/?>", flags=re.IGNORECASE)
+        parts: list[str] = []
+        last = 0
+
+        for matched in pattern.finditer(text):
+            parts.append(text[last : matched.start()])
+            last = matched.end()
+
+            tag_name = matched.group(1).lower()
+            attrs_raw = matched.group(2) or ""
+            attrs = parse_attrs(attrs_raw)
+            if not isinstance(attrs, dict):
+                parts.append(matched.group(0))
+                continue
+
+            src = str(attrs.get("src") or attrs.get("url") or "").strip()
+            if not src or src.startswith("data:"):
+                parts.append(matched.group(0))
+                continue
+            if not (src.startswith("http://") or src.startswith("https://")):
+                parts.append(matched.group(0))
+                continue
+
+            try:
+                content_bytes, ctype = await self._download_image(src)
+                if not content_bytes:
+                    logging.warning(
+                        "reply.image stage=inline status=skip reason=download_failed url=%s",
+                        src,
+                    )
+                    parts.append(matched.group(0))
+                    continue
+                if len(content_bytes) > max_bytes:
+                    logging.warning(
+                        "reply.image stage=inline status=skip reason=too_large bytes=%s url=%s",
+                        len(content_bytes),
+                        src,
+                    )
+                    parts.append(matched.group(0))
+                    continue
+
+                mime_type = self._guess_image_mime(src, "", ctype)
+                data_url = (
+                    f"data:{mime_type};base64,"
+                    f"{base64.b64encode(content_bytes).decode('ascii')}"
+                )
+                logging.info(
+                    "reply.image stage=inline status=ok tag=%s url=%s bytes=%s mime=%s",
+                    tag_name,
+                    src,
+                    len(content_bytes),
+                    mime_type,
+                )
+                parts.append(f'<{tag_name} src="{escape(data_url, quote=True)}"/>')
+            except Exception as exc:  # noqa: BLE001
+                logging.warning(
+                    "reply.image stage=inline status=failed url=%s err=%s",
+                    src,
+                    exc,
+                )
+                parts.append(matched.group(0))
+
+        parts.append(text[last:])
+        return "".join(parts)
 
     @staticmethod
     def _guess_image_mime(url: str, file_name: str, content_type: str) -> str:

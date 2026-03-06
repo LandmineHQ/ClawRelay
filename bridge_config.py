@@ -68,6 +68,7 @@ class Config:
     max_image_attachments: int = env_int("MAX_IMAGE_ATTACHMENTS", 3)
     max_image_download_bytes: int = env_int("MAX_IMAGE_DOWNLOAD_BYTES", 6 * 1024 * 1024)
     image_model_probe_ttl_sec: int = env_int("IMAGE_MODEL_PROBE_TTL_SEC", 300)
+    bridge_proxy_url: str = os.getenv("BRIDGE_PROXY_URL", "")
 
     group_require_at: bool = env_bool("GROUP_REQUIRE_AT", True)
     group_prefix: str = os.getenv("GROUP_PREFIX", "/ai")

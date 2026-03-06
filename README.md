@@ -60,6 +60,7 @@ uv run start
 - `CONTEXT_FLUSH_LIMIT`：触发回复时发送给 OpenClaw 的最近观察条数，默认 `12`
 - `MAX_IMAGE_ATTACHMENTS`：每次最多上传图片附件数，默认 `3`
 - `MAX_IMAGE_DOWNLOAD_BYTES`：单张图片下载上限（字节），默认 `6291456`
+- `BRIDGE_PROXY_URL`：bridge 外网图片下载/探测使用的代理，例如 `socks5://192.168.31.31:20170`；留空可禁用代理
 
 ## 4. 触发规则
 
