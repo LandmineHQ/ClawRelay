@@ -502,6 +502,45 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
     def _openclaw_error_reply(cls, exc: Exception) -> str:
         return f"OpenClaw出错了，{cls._format_error_detail(exc)}"
 
+    @staticmethod
+    def _openclaw_empty_reply_notice() -> str:
+        return "OpenClaw 可能出错了：gateway 返回了空回复，请稍后重试。"
+
+    async def _notify_openclaw_empty_reply(
+        self,
+        run_id: str,
+        route_event: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> None:
+        notice = self._openclaw_empty_reply_notice()
+        log_io(
+            source="bridge",
+            direction="bridge -> satori",
+            content="转发空回复告警",
+            received=None,
+            sent={
+                "run_id": run_id,
+                "route": self._route_log_brief(route_event),
+                "message": notice,
+                "payload": {
+                    "event": payload.get("event"),
+                    "state": payload.get("state"),
+                    "seq": payload.get("seq"),
+                    "sessionKey": payload.get("sessionKey"),
+                },
+            },
+            level=logging.WARNING,
+        )
+        try:
+            await self._send_onebot_reply(route_event, notice)
+        except Exception:  # noqa: BLE001
+            logging.exception("relay.unsolicited status=empty_reply_notice_failed run_id=%s", run_id)
+
+        try:
+            await self._clear_processing_emoji(self._processing_marker_from_event(route_event))
+        except Exception:  # noqa: BLE001
+            logging.exception("relay.unsolicited status=empty_reply_clear_failed run_id=%s", run_id)
+
     async def _relay_unsolicited_completion_to_onebot(
         self,
         run_id: str,
@@ -563,6 +602,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                     sent=None,
                     level=logging.WARNING,
                 )
+                await self._notify_openclaw_empty_reply(run_id, route_event, initial_payload)
                 return
             outbound_text = self._merge_hint_reply(reply_hint, reply)
             log_io(
