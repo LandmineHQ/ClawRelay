@@ -22,6 +22,7 @@ class ParsedMessage:
 class PendingObservation:
     line: str
     normalized_text: str
+    satori_content: str
     images: list[MessageImage]
     ts: float
     sender_name: str = ""

@@ -358,6 +358,73 @@ class OneBotMixin:
                 lines.extend([f"      {piece}" for piece in block.splitlines()])
         return "\n".join(lines)
 
+    def _observation_satori_content(
+        self, event: dict[str, Any], parsed: ParsedMessage
+    ) -> str:
+        evt_raw = event.get("_satori_event")
+        evt = evt_raw if isinstance(evt_raw, dict) else {}
+        msg_raw = evt.get("message")
+        msg = msg_raw if isinstance(msg_raw, dict) else {}
+        content = str(msg.get("content") or "").strip()
+        if content:
+            return content
+        text = (parsed.text or "").strip()
+        if text:
+            return text
+        if parsed.images:
+            return "".join(self._image_tag(img) for img in parsed.images)
+        return "（无文本）"
+
+    @staticmethod
+    def _satori_author_tag(user_id: str, user_name: str) -> str:
+        attrs: list[str] = []
+        uid = (user_id or "").strip()
+        if uid:
+            attrs.append(f'id="{escape(uid, quote=True)}"')
+        name = (user_name or uid or "unknown").strip()
+        if name:
+            attrs.append(f'name="{escape(name, quote=True)}"')
+        if attrs:
+            return f"<author {' '.join(attrs)}/>"
+        return "<author/>"
+
+    def _wrap_satori_message(
+        self,
+        *,
+        message_id: str,
+        sender_id: str,
+        sender_name: str,
+        content: str,
+        extra_blocks: list[str] | None = None,
+    ) -> str:
+        msg_id = (message_id or "").strip()
+        open_tag = f'<message id="{escape(msg_id, quote=True)}">' if msg_id else "<message>"
+        body_parts = [content.strip() or "（无文本）"]
+        if extra_blocks:
+            for block in extra_blocks:
+                value = (block or "").strip()
+                if value:
+                    body_parts.append(value)
+        body = "\n".join(body_parts)
+        return (
+            f"{open_tag}{self._satori_author_tag(sender_id, sender_name)}"
+            f"{body}</message>"
+        )
+
+    def _observation_to_prompt_message(self, obs: PendingObservation) -> str:
+        extra_blocks: list[str] = []
+        if obs.reply_blocks:
+            extra_blocks.append(f"<message forward>{''.join(obs.reply_blocks)}</message>")
+        if obs.forward_blocks:
+            extra_blocks.append(f"<message forward>{''.join(obs.forward_blocks)}</message>")
+        return self._wrap_satori_message(
+            message_id=obs.message_id,
+            sender_id=obs.sender_id,
+            sender_name=obs.sender_name,
+            content=obs.satori_content,
+            extra_blocks=extra_blocks,
+        )
+
     def _record_observation(
         self, event: dict[str, Any], session_key: str, parsed: ParsedMessage
     ) -> None:
@@ -377,6 +444,7 @@ class OneBotMixin:
             PendingObservation(
                 line=line,
                 normalized_text=normalized_text,
+                satori_content=self._observation_satori_content(event, parsed),
                 images=list(images),
                 ts=ts,
                 sender_name=sender_name,
@@ -553,25 +621,24 @@ class OneBotMixin:
         bot_id = (bot_user_id or "").strip() or "unknown"
 
         if latest_obs is not None:
-            current_block = self._format_observation_item(latest_obs)
+            current_block = self._observation_to_prompt_message(latest_obs)
         else:
-            current_block = (
-                "- time: unknown\n"
-                "  user_name: unknown\n"
-                "  user_id: unknown\n"
-                "  message_id: unknown\n"
-                f"  content: {latest_line.strip() or '（无文本）'}\n"
-                "  reply_ids: null\n"
-                "  forward_ids: null"
+            current_block = self._wrap_satori_message(
+                message_id="",
+                sender_id="unknown",
+                sender_name="unknown",
+                content=latest_line.strip() or "（无文本）",
             )
 
-        history_lines = [self._format_observation_item(item) for item in history]
+        history_lines = [self._observation_to_prompt_message(item) for item in history]
         history_block = (
-            "\n\n".join(history_lines) if history_lines else "（无历史记录）"
+            f"<message forward>{''.join(history_lines)}</message>"
+            if history_lines
+            else "<message forward/>"
         )
 
         # 将零散的规则归类为三大模块，并使用 Markdown 加粗强调核心约束
-        rule_block = f"""<rules>
+        rule_block = f"""<rules>\n
 1. 【身份与识别】
    - 你的 user_id 是：{bot_id}。当 `<at id="{bot_id}"/>` 出现时，代表用户在@你。
    - 用户的 user_name 可能包含纯数字（如“我是1354987”），这只是昵称，**绝不可将其作为 QQ 号（user_id）**。
@@ -592,7 +659,7 @@ class OneBotMixin:
             else ""
         )
 
-        prompt = f"""{guidance}<history>
+        prompt = f"""{guidance}\n<history>
 {history_block}
 </history>
 
@@ -1249,9 +1316,19 @@ class OneBotMixin:
                     if reply_id in quote_id_set
                     else "无法拉取引用消息内容"
                 )
-                reply_blocks.append(
-                    "[引用消息]\n" f"- message_id: {reply_id}\n" f"- status: {status}"
+                block, _images = self._build_parsed_context_block(
+                    "引用消息",
+                    reply_id,
+                    ParsedMessage(
+                        text="",
+                        mentioned=False,
+                        images=[],
+                    ),
+                    user_name="system",
+                    user_id="system",
+                    status=status,
                 )
+                reply_blocks.append(block)
                 continue
             block, images = self._build_satori_message_context_block(
                 "引用消息", reply_id, data, self_qq
@@ -1312,9 +1389,19 @@ class OneBotMixin:
                 if forward_id in quote_id_set
                 else "当前平台不支持按该 id 拉取转发节点详情"
             )
-            forward_blocks.append(
-                "[转发消息]\n" f"- message_id: {forward_id}\n" f"- status: {status}"
+            block, _images = self._build_parsed_context_block(
+                "转发消息",
+                forward_id,
+                ParsedMessage(
+                    text="",
+                    mentioned=False,
+                    images=[],
+                ),
+                user_name="system",
+                user_id="system",
+                status=status,
             )
+            forward_blocks.append(block)
 
         text_out = parsed.text
         if not text_out.strip():
@@ -1426,23 +1513,20 @@ class OneBotMixin:
         user_id: str = "unknown",
         status: str = "",
     ) -> tuple[str, list[MessageImage]]:
-        preview = self._truncate_text(
-            self._compact_text(parsed.text or "（无文本）"), 300
-        )
-        reply_ids = ", ".join(parsed.reply_ids) if parsed.reply_ids else "null"
-        forward_ids = ", ".join(parsed.forward_ids) if parsed.forward_ids else "null"
-        lines = [
-            f"[{tag}]",
-            f"- message_id: {message_id}",
-            f"- user_name: {user_name}",
-            f"- user_id: {user_id}",
-            f"- content: {preview}",
-            f"- reply_ids: {reply_ids}",
-            f"- forward_ids: {forward_ids}",
-        ]
+        content = (parsed.text or "").strip()
+        if not content and parsed.images:
+            content = "".join(self._image_tag(img) for img in parsed.images)
+        if not content:
+            content = "（无文本）"
         if status:
-            lines.append(f"- status: {status}")
-        return "\n".join(lines), parsed.images
+            content = f"{content}\n[{tag}状态] {status}"
+        block = self._wrap_satori_message(
+            message_id=message_id,
+            sender_id=user_id or "unknown",
+            sender_name=user_name or user_id or "unknown",
+            content=content,
+        )
+        return block, parsed.images
 
     def _build_satori_message_context_block(
         self, tag: str, message_id: str, payload: dict[str, Any], self_qq: str
@@ -1475,14 +1559,13 @@ class OneBotMixin:
             if callable(parser)
             else self._extract_message_from_payload(content, self_qq)
         )
-        block, images = self._build_parsed_context_block(
-            tag,
-            message_id,
-            parsed,
-            user_name=sender_name or "unknown",
-            user_id=sender_id or "unknown",
+        block = self._wrap_satori_message(
+            message_id=message_id,
+            sender_id=sender_id or "unknown",
+            sender_name=sender_name or sender_id or "unknown",
+            content=content or "（无文本）",
         )
-        return block, images
+        return block, parsed.images
 
     async def _download_image(self, url: str) -> tuple[bytes | None, str]:
         assert self.session is not None
