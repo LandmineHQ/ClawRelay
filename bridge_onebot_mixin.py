@@ -388,6 +388,17 @@ class OneBotMixin:
             return f"<author {' '.join(attrs)}/>"
         return "<author/>"
 
+    @staticmethod
+    def _normalize_outgoing_at_spacing(content: str) -> str:
+        if not content:
+            return ""
+        return re.sub(
+            r"(<at\b[^>]*?/>)((?=[^\s<])|$)",
+            r"\1 ",
+            content,
+            flags=re.IGNORECASE,
+        )
+
     def _wrap_satori_message(
         self,
         *,
@@ -642,11 +653,9 @@ class OneBotMixin:
 1. 【身份与识别】
    - 你的 user_id 是：{bot_id}。当 `<at id="{bot_id}"/>` 出现时，代表用户在@你。
    - 用户的 user_name 可能包含纯数字（如“我是1354987”），这只是昵称，**绝不可将其作为 QQ 号（user_id）**。
-
 2. 【格式与语法】
    - 必须使用 Satori 格式标签与文本混排，支持：`<at id="user_id"/>`、`<quote id="message_id"/>`、`<img src="url"/>`。
    - **默认保持纯文本简洁回复**，仅当用户明确要求使用 Markdown 时才使用。
-
 3. 【回复规范】
    - 默认行为：在回复开头优先使用 `<quote id="{current_message_id}"/>` 引用当前待回复消息，再使用 `<at id="{current_sender_id}"/>` 提及当前发送者（除非被明确要求不这么做）。
    - 引用限制：**仅可使用上下文中出现过的 message_id**（如 reply_ids/forward_ids 等）进行引用，严禁编造 id。
@@ -659,14 +668,16 @@ class OneBotMixin:
             else ""
         )
 
-        prompt = f"""{guidance}\n<history>
+        prompt = f"""
+{guidance}
+history
+```xml
 {history_block}
-</history>
-
-<current_message>
+```
+current_message
+```xml
 {current_block}
-</current_message>
-
+```
 {rule_block}"""
 
         return prompt.strip()
@@ -718,6 +729,7 @@ class OneBotMixin:
             uid = str(event.get("user_id") or "").strip()
             if uid and not self._contains_satori_at_user(outgoing, uid):
                 outgoing = f'<at id="{uid}"/> {outgoing}'
+        outgoing = self._normalize_outgoing_at_spacing(outgoing).strip()
         payload = {
             "channel_id": route["channel_id"],
             "content": outgoing,
