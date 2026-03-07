@@ -61,6 +61,8 @@ uv run start
 - `MAX_IMAGE_ATTACHMENTS`：每次最多上传图片附件数，默认 `3`
 - `MAX_IMAGE_DOWNLOAD_BYTES`：单张图片下载上限（字节），默认 `6291456`
 - `BRIDGE_PROXY_URL`：bridge 外网图片下载/探测使用的代理，例如 `socks5://192.168.31.31:20170`；留空可禁用代理
+- `OPENCLAW_MEDIA_CONTAINER_ROOT`：OpenClaw 容器内媒体根目录，默认 `/home/node/.openclaw`
+- `OPENCLAW_MEDIA_HOST_ROOT`：上述目录在宿主机上的映射根目录，默认 `/opt/1panel/apps/openclaw/OpenClaw/data/conf`
 
 ## 4. 触发规则
 
