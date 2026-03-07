@@ -176,14 +176,6 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         if task is not None and not task.done():
             task.cancel()
 
-    @staticmethod
-    def _normalize_openclaw_session_key(session_key: str) -> str:
-        key = session_key.strip()
-        prefix = "agent:main:"
-        if key.startswith(prefix):
-            return key[len(prefix) :]
-        return key
-
     def _bind_onebot_route(self, session_key: str, event: dict[str, Any]) -> None:
         key = self._normalize_openclaw_session_key(session_key)
         if not key:
