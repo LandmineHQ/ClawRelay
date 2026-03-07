@@ -551,23 +551,6 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         except Exception:  # noqa: BLE001
             logging.exception("relay.unsolicited status=empty_reply_clear_failed run_id=%s", run_id)
 
-    @classmethod
-    def _extract_satori_image_urls(cls, content: str) -> list[str]:
-        urls: list[str] = []
-        seen: set[str] = set()
-        for seg in cls._satori_content_to_segments(content):
-            if not isinstance(seg, dict):
-                continue
-            seg_type = str(seg.get("type") or "").strip().lower()
-            if seg_type not in {"img", "image"}:
-                continue
-            url = str(seg.get("src") or "").strip()
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            urls.append(url)
-        return urls
-
     @staticmethod
     def _broken_image_detail_text(broken_images: list[dict[str, str]]) -> str:
         parts: list[str] = []
@@ -578,22 +561,6 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
                 continue
             parts.append(f"{url} ({reason or 'unknown'})")
         return "; ".join(parts)
-
-    @classmethod
-    def _broken_image_retry_prompt(
-        cls,
-        broken_images: list[dict[str, str]],
-        failed_reply: str,
-    ) -> str:
-        _ = broken_images
-        reply_content = failed_reply.strip() or "（空）"
-        return (
-            "system: 回复中的图片无法访问，请针对这条具体回复自行处理图片问题并重新生成最终回复。"
-            "\n出错的待发送回复内容如下："
-            f"\n```xml\n{reply_content}\n```"
-            "\n如果无法提供可访问图片，就不要输出图片，改为纯文本。"
-            "\n只输出最终要发送给 Satori 的完整回复内容，不要附加解释。"
-        )
 
     async def _prepare_gateway_reply_for_satori(
         self,
@@ -606,98 +573,20 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
     ) -> str:
         current_reply = reply_text.strip()
         hint_text = reply_hint.strip()
-        current_ws_url = ws_url
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + float(self.cfg.openclaw_timeout_sec)
-
-        for attempt in range(2):
-            outbound_text = self._merge_hint_reply(hint_text, current_reply)
-            image_urls = self._extract_satori_image_urls(outbound_text)
-            if not image_urls:
-                return outbound_text
-
-            broken_images: list[dict[str, str]] = []
-            for url in image_urls:
-                reason = await self._probe_satori_image_source(url)
-                if reason is None:
-                    continue
-                broken_images.append({"url": url, "reason": reason})
-
-            if not broken_images:
-                return outbound_text
-
+        _ = session_key, ws_url
+        outbound_text = self._merge_hint_reply(hint_text, current_reply)
+        sanitized_text, broken_images = await self._literalize_inaccessible_satori_images(
+            outbound_text,
+            run_id=run_id,
+        )
+        if broken_images:
             detail = self._broken_image_detail_text(broken_images)
             logging.warning(
-                "reply.image stage=probe status=failed run_id=%s attempt=%s bad=%s",
+                "reply.image stage=probe status=literalized run_id=%s bad=%s",
                 run_id,
-                attempt + 1,
                 detail,
             )
-            if attempt >= 1:
-                raise RuntimeError(f"以下图片无法访问：{detail}")
-
-            retry_prompt = self._broken_image_retry_prompt(
-                broken_images,
-                outbound_text,
-            )
-            log_io(
-                source="bridge",
-                direction="bridge -> gateway",
-                content="请求重生成：回复图片不可访问",
-                received=None,
-                sent={
-                    "run_id": run_id,
-                    "session_key": session_key,
-                    "ws_url": current_ws_url,
-                    "bad_images": broken_images,
-                    "message": retry_prompt,
-                },
-                level=logging.WARNING,
-            )
-            retry_ws_url, retry_run_id, retry_text = await self._submit_openclaw(
-                session_key,
-                retry_prompt,
-                [],
-            )
-            current_ws_url = retry_ws_url
-            if retry_run_id:
-                self.gateway_relay_runs.add(retry_run_id)
-            try:
-                if retry_text:
-                    current_reply = retry_text.strip()
-                elif retry_run_id:
-                    retry_reply = await self._wait_shared_run_result(
-                        run_id=retry_run_id,
-                        session_key=session_key,
-                        ws_url=retry_ws_url,
-                        timeout_sec=max(0.1, deadline - loop.time()),
-                        initial_payload={
-                            "runId": retry_run_id,
-                            "event": "bridge.reply_retry",
-                            "sessionKey": session_key,
-                            "seq": 0,
-                        },
-                    )
-                    current_reply = (retry_reply or "").strip()
-                else:
-                    current_reply = ""
-            finally:
-                if retry_run_id:
-                    self.gateway_relay_runs.discard(retry_run_id)
-
-            if not current_reply:
-                followup_reply = await self._wait_for_session_followup_run(
-                    session_key=session_key,
-                    ws_url=current_ws_url,
-                    exclude_run_ids={run_id, retry_run_id or ""},
-                    timeout_sec=max(0.1, deadline - loop.time()),
-                )
-                current_reply = (followup_reply or "").strip()
-
-            if not current_reply:
-                raise RuntimeError("图片重生成失败：gateway 返回空回复")
-
-        return self._merge_hint_reply(hint_text, current_reply)
+        return sanitized_text
 
     async def _relay_unsolicited_completion_to_onebot(
         self,

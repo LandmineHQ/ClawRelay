@@ -8,6 +8,7 @@ from datetime import datetime
 from html import escape
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -180,6 +181,59 @@ class OneBotMixin:
         if satori_host and urlparse(url).netloc == satori_host and token:
             headers["Authorization"] = f"Bearer {token}"
         return headers
+
+    @staticmethod
+    def _looks_like_image_bytes(body: bytes) -> bool:
+        sample = body[:16]
+        return sample.startswith(
+            (
+                b"\x89PNG\r\n\x1a\n",
+                b"\xff\xd8\xff",
+                b"GIF87a",
+                b"GIF89a",
+                b"RIFF",
+                b"BM",
+            )
+        )
+
+    @classmethod
+    def _non_image_payload_reason(cls, body: bytes, content_type: str) -> str | None:
+        lowered = (content_type or "").split(";", 1)[0].strip().lower()
+        if lowered.startswith("image/"):
+            return None
+        if cls._looks_like_image_bytes(body):
+            return None
+
+        if lowered:
+            if lowered.startswith("text/"):
+                return f"content-type={lowered}"
+            if lowered in {
+                "application/json",
+                "text/json",
+                "application/problem+json",
+                "application/xml",
+                "text/xml",
+            }:
+                try:
+                    preview = body[:240].decode("utf-8", errors="ignore").strip()
+                except Exception:  # noqa: BLE001
+                    preview = ""
+                if preview:
+                    compact = re.sub(r"\s+", " ", preview)
+                    return f"{lowered}: {compact[:160]}"
+                return f"content-type={lowered}"
+
+        stripped = body.lstrip()
+        if stripped.startswith((b"{", b"[")):
+            try:
+                preview = stripped[:240].decode("utf-8", errors="ignore").strip()
+            except Exception:  # noqa: BLE001
+                preview = ""
+            if preview:
+                compact = re.sub(r"\s+", " ", preview)
+                return f"non_image_payload: {compact[:160]}"
+            return "non_image_payload"
+        return None
 
     def _extract_message_from_payload(
         self, payload: Any, self_qq: str
@@ -1616,6 +1670,14 @@ current_message
                     return None, ""
                 body = await resp.read()
                 ctype = resp.headers.get("Content-Type", "")
+                reason = self._non_image_payload_reason(body, ctype)
+                if reason is not None:
+                    logging.warning(
+                        "media.image stage=skip reason=non_image_payload url=%s detail=%s",
+                        url,
+                        reason,
+                    )
+                    return None, ctype
                 return body, ctype
         except Exception:  # noqa: BLE001
             return None, ""
@@ -1639,8 +1701,10 @@ current_message
                 if resp.status >= 400:
                     return f"HTTP {resp.status}"
                 content_type = str(resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-                if content_type.startswith("text/"):
-                    return f"content-type={content_type}"
+                sample = await resp.content.read(512)
+                reason = self._non_image_payload_reason(sample, content_type)
+                if reason is not None:
+                    return reason
                 return None
         except Exception as exc:  # noqa: BLE001
             detail = str(exc).strip()
@@ -1659,6 +1723,89 @@ current_message
         if local_path is None:
             return "missing_local_file"
         return None
+
+    async def _literalize_inaccessible_satori_images(
+        self,
+        content: str,
+        *,
+        run_id: str = "",
+    ) -> tuple[str, list[dict[str, str]]]:
+        text = content or ""
+        if not text:
+            return "", []
+
+        parse_attrs = getattr(self, "_satori_parse_tag_attrs", None)
+        if not callable(parse_attrs):
+            return text, []
+
+        code_pattern = re.compile(r"(```.*?```|`[^`\n]+`)", flags=re.DOTALL)
+        parts: list[str] = []
+        broken_images: list[dict[str, str]] = []
+        last = 0
+
+        for matched in code_pattern.finditer(text):
+            sanitized, broken = await self._literalize_inaccessible_satori_images_in_fragment(
+                text[last : matched.start()],
+                parse_attrs,
+                run_id=run_id,
+            )
+            parts.append(sanitized)
+            broken_images.extend(broken)
+            parts.append(matched.group(0))
+            last = matched.end()
+
+        sanitized, broken = await self._literalize_inaccessible_satori_images_in_fragment(
+            text[last:],
+            parse_attrs,
+            run_id=run_id,
+        )
+        parts.append(sanitized)
+        broken_images.extend(broken)
+        return "".join(parts), broken_images
+
+    async def _literalize_inaccessible_satori_images_in_fragment(
+        self,
+        fragment: str,
+        parse_attrs: Any,
+        *,
+        run_id: str = "",
+    ) -> tuple[str, list[dict[str, str]]]:
+        text = fragment or ""
+        if not text:
+            return "", []
+
+        pattern = re.compile(r"<(img|image)\b([^>]*)/?>", flags=re.IGNORECASE)
+        parts: list[str] = []
+        broken_images: list[dict[str, str]] = []
+        last = 0
+
+        for matched in pattern.finditer(text):
+            parts.append(text[last : matched.start()])
+            last = matched.end()
+
+            attrs = parse_attrs(matched.group(2) or "")
+            if not isinstance(attrs, dict):
+                parts.append(self._escape_satori_literal(matched.group(0)))
+                broken_images.append({"url": "", "reason": "invalid_attrs"})
+                continue
+
+            src = str(attrs.get("src") or attrs.get("url") or "").strip()
+            reason = await self._probe_satori_image_source(src)
+            if reason is None:
+                parts.append(matched.group(0))
+                continue
+
+            logging.warning(
+                "reply.image stage=sanitize status=literalized run_id=%s src=%s reason=%s",
+                run_id,
+                src or "-",
+                reason,
+            )
+            broken_images.append({"url": src or matched.group(0), "reason": reason})
+            parts.append(self._escape_satori_literal(matched.group(0)))
+
+        parts.append(text[last:])
+        return "".join(parts), broken_images
 
     def _resolve_local_image_path(self, src: str) -> Path | None:
         raw = (src or "").strip()
