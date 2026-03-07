@@ -6,8 +6,8 @@ import re
 from collections import deque
 from datetime import datetime
 from html import escape
+from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 import aiohttp
 
@@ -752,6 +752,30 @@ current_message
             flags=re.IGNORECASE,
         )
         return bool(pattern.search(text or ""))
+
+    @staticmethod
+    def _escape_satori_literal(text: str) -> str:
+        return (
+            (text or "")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+    def _escape_satori_code_like_segments(self, content: str) -> str:
+        text = content or ""
+        if not text:
+            return ""
+
+        pattern = re.compile(r"(```.*?```|`[^`\n]+`)", flags=re.DOTALL)
+        parts: list[str] = []
+        last = 0
+        for matched in pattern.finditer(text):
+            parts.append(text[last : matched.start()])
+            parts.append(self._escape_satori_literal(matched.group(0)))
+            last = matched.end()
+        parts.append(text[last:])
+        return "".join(parts)
 
     async def _mark_processing_emoji(
         self, event: dict[str, Any]
@@ -1622,8 +1646,53 @@ current_message
             detail = str(exc).strip()
             return detail or type(exc).__name__
 
+    async def _probe_satori_image_source(self, src: str) -> str | None:
+        normalized = (src or "").strip()
+        if not normalized:
+            return "missing_url"
+        if normalized.startswith("data:"):
+            return None
+        if normalized.startswith("http://") or normalized.startswith("https://"):
+            return await self._probe_remote_image_url(normalized)
+
+        local_path = self._resolve_local_image_path(normalized)
+        if local_path is None:
+            return "missing_local_file"
+        return None
+
+    def _resolve_local_image_path(self, src: str) -> Path | None:
+        raw = (src or "").strip()
+        if not raw:
+            return None
+        resolved_raw = raw
+        if raw.lower().startswith("media:"):
+            resolved_raw = raw[6:].strip()
+
+        path = Path(resolved_raw).expanduser()
+        candidates: list[Path] = []
+        if path.is_absolute():
+            candidates.append(path)
+        elif resolved_raw:
+            candidates.append(Path.cwd() / path)
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    return candidate.resolve()
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    @staticmethod
+    def _read_local_image_file(path: Path) -> tuple[bytes | None, str]:
+        try:
+            content = path.read_bytes()
+        except Exception:  # noqa: BLE001
+            return None, ""
+        mime_type = mimetypes.guess_type(str(path))[0] or ""
+        return content, mime_type
+
     async def _inline_satori_image_data_urls(self, content: str) -> str:
-        text = (content or "").strip()
+        text = self._escape_satori_code_like_segments((content or "").strip())
         if not text:
             return ""
 
@@ -1651,12 +1720,27 @@ current_message
             if not src or src.startswith("data:"):
                 parts.append(matched.group(0))
                 continue
-            if not (src.startswith("http://") or src.startswith("https://")):
-                parts.append(matched.group(0))
-                continue
 
             try:
-                content_bytes, ctype = await self._download_image(src)
+                if src.startswith("http://") or src.startswith("https://"):
+                    content_bytes, ctype = await self._download_image(src)
+                else:
+                    local_path = self._resolve_local_image_path(src)
+                    if local_path is None:
+                        logging.info(
+                            "reply.image stage=inline status=literalize reason=unsupported_src src=%s",
+                            src,
+                        )
+                        parts.append(self._escape_satori_literal(matched.group(0)))
+                        continue
+                    content_bytes, ctype = self._read_local_image_file(local_path)
+                    if content_bytes:
+                        logging.info(
+                            "reply.image stage=inline status=ok tag=%s local_path=%s bytes=%s",
+                            tag_name,
+                            local_path,
+                            len(content_bytes),
+                        )
                 if not content_bytes:
                     logging.warning(
                         "reply.image stage=inline status=skip reason=download_failed url=%s",

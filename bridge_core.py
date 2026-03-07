@@ -588,7 +588,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
         _ = broken_images
         reply_content = failed_reply.strip() or "（空）"
         return (
-            "下面这条待发送回复中的图片无法访问，请针对这条具体回复自行处理图片问题并重新生成最终回复。"
+            "system: 回复中的图片无法访问，请针对这条具体回复自行处理图片问题并重新生成最终回复。"
             "\n出错的待发送回复内容如下："
             f"\n```xml\n{reply_content}\n```"
             "\n如果无法提供可访问图片，就不要输出图片，改为纯文本。"
@@ -618,7 +618,7 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
 
             broken_images: list[dict[str, str]] = []
             for url in image_urls:
-                reason = await self._probe_remote_image_url(url)
+                reason = await self._probe_satori_image_source(url)
                 if reason is None:
                     continue
                 broken_images.append({"url": url, "reason": reason})
