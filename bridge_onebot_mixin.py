@@ -8,7 +8,7 @@ from datetime import datetime
 from html import escape
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse, urlsplit
 
 import aiohttp
 
@@ -1678,28 +1678,37 @@ current_message
         if not raw:
             return None
         resolved_raw = raw
-        is_media_ref = raw.lower().startswith("media:")
-        if raw.lower().startswith("media:"):
+        lowered = raw.lower()
+        if lowered.startswith("media:"):
             resolved_raw = raw[6:].strip()
+        elif lowered.startswith("file://"):
+            parsed = urlsplit(raw)
+            if parsed.scheme.lower() != "file":
+                return None
+            host = (parsed.netloc or "").strip().lower()
+            if host and host not in {"localhost", "127.0.0.1", "::1"}:
+                return None
+            resolved_raw = unquote(parsed.path or "").strip()
+            if not resolved_raw:
+                return None
 
         path = Path(resolved_raw).expanduser()
         candidates: list[Path] = []
         if path.is_absolute():
             candidates.append(path)
-            if is_media_ref:
-                container_root = Path(
-                    self.cfg.openclaw_media_container_root.strip() or "/home/node/.openclaw"
-                )
-                host_root = Path(
-                    self.cfg.openclaw_media_host_root.strip()
-                    or "/opt/1panel/apps/openclaw/OpenClaw/data/conf"
-                )
-                try:
-                    relative = path.relative_to(container_root)
-                except ValueError:
-                    relative = None
-                if relative is not None:
-                    candidates.append(host_root / relative)
+            container_root = Path(
+                self.cfg.openclaw_media_container_root.strip() or "/home/node/.openclaw"
+            )
+            host_root = Path(
+                self.cfg.openclaw_media_host_root.strip()
+                or "/opt/1panel/apps/openclaw/OpenClaw/data/conf"
+            )
+            try:
+                relative = path.relative_to(container_root)
+            except ValueError:
+                relative = None
+            if relative is not None:
+                candidates.append(host_root / relative)
         elif resolved_raw:
             candidates.append(Path.cwd() / path)
         for candidate in candidates:
