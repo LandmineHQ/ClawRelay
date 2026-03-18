@@ -915,17 +915,18 @@ class OpenClawOneBotBridge(OneBotMixin, OpenClawGatewayMixin):
             log_io(
                 source="bridge",
                 direction="bridge -> gateway",
-                content="转发 /new 指令",
+                content="通过 chat.send 发送 /new",
                 received=None,
                 sent={
-                    "method": "send",
-                    "to": session_key,
+                    "method": "chat.send",
+                    "sessionKey": session_key,
                     "message": "/new",
                 },
             )
-            ws_url, run_id, instant_text = await self._trigger_openclaw_command(
+            ws_url, run_id, instant_text = await self._submit_openclaw(
                 session_key,
                 "/new",
+                [],
             )
             if instant_text:
                 await self._send_onebot_reply(event, instant_text)

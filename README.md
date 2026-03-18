@@ -6,7 +6,7 @@
 
 - `Satori HTTP`: `http://127.0.0.1:5600`
 - `Satori WS`: `ws://127.0.0.1:5600/v1/events`
-- `OpenClaw Gateway WS`: `ws://127.0.0.1:18789`
+- `OpenClaw Gateway WS`: `wss://127.0.0.1:18789`
 
 ## 代码结构
 
@@ -29,21 +29,24 @@ uv sync
 uv run start
 ```
 
-## 3. 可选环境变量
+## 3. 环境变量
 
 - `SATORI_HTTP_BASE`：默认 `http://127.0.0.1:5600`
 - `SATORI_WS_URL`：默认 `ws://127.0.0.1:5600/v1/events`
-- `SATORI_TOKEN`：Satori token（默认沿用你原有 token，可覆盖）
+- `SATORI_TOKEN`：必填，Satori token
 - `SATORI_PLATFORM`：默认 `chronocat`
 - `SATORI_SELF_ID`：可选，机器人账号 ID
 - `SATORI_PROCESSING_EMOJI_ID`：处理中表态 id，默认 `30`（QQ 奋斗）
-- `OPENCLAW_WS_URL`：默认 `ws://127.0.0.1:18789`
-- `OPENCLAW_GATEWAY_TOKEN`：Gateway token（默认写入了当前机器 OpenClaw 配置中的 token，可覆盖）
-- `OPENCLAW_GATEWAY_PASSWORD`：Gateway password（如你使用密码鉴权）
-- `OPENCLAW_CLIENT_ID`：默认 `gateway-client`
-- `OPENCLAW_CLIENT_MODE`：默认 `backend`
+- `OPENCLAW_WS_URL`：默认 `wss://127.0.0.1:18789`
+- `OPENCLAW_GATEWAY_TOKEN`：必填，Gateway token；仅从环境变量读取
+- `OPENCLAW_GATEWAY_PASSWORD`：Gateway password；仅从环境变量读取
+- `OPENCLAW_CLIENT_ID`：默认 `openclaw-control-ui`
+- `OPENCLAW_CLIENT_MODE`：默认 `ui`
+- `OPENCLAW_WS_ORIGIN`：当网关启用了 `gateway.controlUi.allowedOrigins` 时必填；应填写一个被允许的 Origin，例如 `https://你的OpenClaw地址:18789`
 - `OPENCLAW_ROLE`：默认 `operator`
 - `OPENCLAW_SCOPES`：默认 `operator.read,operator.write`
+- `OPENCLAW_WS_VERIFY_SSL`：OpenClaw `wss` 证书校验开关；默认留空自动判断，连接 `127.0.0.1/localhost/::1` 时会自动关闭校验，远端地址保持校验
+- `OPENCLAW_WS_CA_FILE`：自定义 CA 证书文件路径；当你使用自签名或私有 CA 证书且希望保留校验时可设置
 - `OPENCLAW_TIMEOUT_SEC`：OpenClaw 单次问答超时，默认 `180`
 - `OPENCLAW_SESSION_PREFIX`：会话前缀，默认 `llonebot`
 - `REQUIRE_PAIRING`：是否开启 OP 审批配对门禁（私聊/群聊均生效），默认 `true`
@@ -76,7 +79,7 @@ uv run start
   - 以 `GROUP_PREFIX`（默认 `/ai`）开头
 - 内建指令：
   - 说明：以下指令均支持带 `/` 或不带 `/`
-  - `/new`：重置当前会话（桥接会调用 OpenClaw `sessions.reset`）
+  - `/new`：重置当前会话（桥接会对同一 `sessionKey` 发送精确的 `/new`）
   - `/pair <配对码>`：OP 审批配对（私聊/群聊）
   - `/unpair`：OP 取消当前会话配对（私聊/群聊）
   - `/op list|add|del`：OP 列表查看/增删（仅 OP 可执行；群聊也仅 OP 可执行）

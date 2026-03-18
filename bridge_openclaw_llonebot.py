@@ -3,10 +3,11 @@ import asyncio
 import contextlib
 import logging
 import signal
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).resolve().with_name(".env"))
 
 from bridge_config import Config
 from bridge_core import OpenClawOneBotBridge
@@ -18,6 +19,7 @@ async def main() -> None:
         level=getattr(logging, cfg.log_level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
+    cfg.validate_required_tokens()
     bridge = OpenClawOneBotBridge(cfg)
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -68,6 +70,9 @@ def cli() -> None:
         asyncio.run(main())
     except KeyboardInterrupt:
         logging.info("runtime status=stopped reason=keyboard_interrupt")
+    except ValueError as exc:
+        logging.error("startup status=failed err=%s", exc)
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":

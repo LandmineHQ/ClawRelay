@@ -19,6 +19,16 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def env_optional_bool(name: str) -> bool | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized == "":
+        return None
+    return normalized in {"1", "true", "yes", "on"}
+
+
 @dataclass
 class Config:
     # Satori 接入参数
@@ -29,15 +39,16 @@ class Config:
     satori_self_id: str = os.getenv("SATORI_SELF_ID", os.getenv("BOT_SELF_QQ", ""))
     satori_processing_emoji_id: int = env_int("SATORI_PROCESSING_EMOJI_ID", 30)
 
-    openclaw_ws_url: str = os.getenv("OPENCLAW_WS_URL", "ws://127.0.0.1:18789")
-    openclaw_gateway_token: str = os.getenv(
-        "OPENCLAW_GATEWAY_TOKEN", "tifptgkqzf32zrraggcych6gqyq7x52x"
-    )
+    openclaw_ws_url: str = os.getenv("OPENCLAW_WS_URL", "wss://127.0.0.1:18789")
+    openclaw_gateway_token: str = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
     openclaw_gateway_password: str = os.getenv("OPENCLAW_GATEWAY_PASSWORD", "")
-    openclaw_client_id: str = os.getenv("OPENCLAW_CLIENT_ID", "gateway-client")
-    openclaw_client_mode: str = os.getenv("OPENCLAW_CLIENT_MODE", "backend")
+    openclaw_client_id: str = os.getenv("OPENCLAW_CLIENT_ID", "openclaw-control-ui")
+    openclaw_client_mode: str = os.getenv("OPENCLAW_CLIENT_MODE", "ui")
     openclaw_role: str = os.getenv("OPENCLAW_ROLE", "operator")
     openclaw_scopes: str = os.getenv("OPENCLAW_SCOPES", "operator.read,operator.write")
+    openclaw_ws_origin: str = os.getenv("OPENCLAW_WS_ORIGIN", "")
+    openclaw_ws_verify_ssl: bool | None = env_optional_bool("OPENCLAW_WS_VERIFY_SSL")
+    openclaw_ws_ca_file: str = os.getenv("OPENCLAW_WS_CA_FILE", "")
     openclaw_timeout_sec: int = env_int("OPENCLAW_TIMEOUT_SEC", 180)
     openclaw_session_prefix: str = os.getenv("OPENCLAW_SESSION_PREFIX", "llonebot")
     require_pairing: bool = env_bool(
@@ -84,3 +95,20 @@ class Config:
 
     self_qq: str = os.getenv("BOT_SELF_QQ", "")
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
+
+    def missing_required_tokens(self) -> list[str]:
+        missing: list[str] = []
+        if not self.satori_token.strip():
+            missing.append("SATORI_TOKEN")
+        if not self.openclaw_gateway_token.strip():
+            missing.append("OPENCLAW_GATEWAY_TOKEN")
+        return missing
+
+    def validate_required_tokens(self) -> None:
+        missing = self.missing_required_tokens()
+        if not missing:
+            return
+        missing_text = ", ".join(missing)
+        raise ValueError(
+            f"缺少必填 token 配置：{missing_text}。请在项目目录的 .env 中设置后再启动。"
+        )

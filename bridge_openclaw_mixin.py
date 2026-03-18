@@ -1,11 +1,14 @@
 import asyncio
+import ipaddress
 import json
 import logging
+import ssl
 import time
 import uuid
 from collections import defaultdict, deque
 from html import escape
 from typing import Any, cast
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -166,6 +169,107 @@ class OpenClawGatewayMixin:
 
     def _scopes_list(self) -> list[str]:
         return [s.strip() for s in self.cfg.openclaw_scopes.split(",") if s.strip()]
+
+    def _log_granted_scopes(
+        self,
+        *,
+        payload: dict[str, Any],
+        requested_scopes: list[str],
+        ws_url: str,
+        source: str,
+    ) -> None:
+        granted_value = payload.get("scopes")
+        granted_scopes = [
+            str(item).strip()
+            for item in cast(list[object], granted_value if isinstance(granted_value, list) else [])
+            if str(item).strip()
+        ]
+        if not granted_scopes:
+            snapshot = self._json_dict_or_empty(payload.get("snapshot"))
+            presence = snapshot.get("presence")
+            if isinstance(presence, list):
+                for raw_item in presence:
+                    item = self._json_dict_or_empty(raw_item)
+                    if (
+                        str(item.get("host") or "").strip() == self.cfg.openclaw_client_id
+                        and str(item.get("mode") or "").strip() == self.cfg.openclaw_client_mode
+                    ):
+                        item_scopes = item.get("scopes")
+                        if isinstance(item_scopes, list):
+                            granted_scopes = [
+                                str(scope).strip() for scope in item_scopes if str(scope).strip()
+                            ]
+                        break
+        if not granted_scopes:
+            logging.info(
+                "openclaw.connect status=ok via=%s source=%s requested_scopes=%s granted_scopes=unknown",
+                ws_url,
+                source,
+                requested_scopes,
+            )
+            return
+
+        missing_scopes = [item for item in requested_scopes if item not in granted_scopes]
+        level = logging.WARNING if missing_scopes else logging.INFO
+        logging.log(
+            level,
+            "openclaw.connect status=ok via=%s source=%s requested_scopes=%s granted_scopes=%s missing_scopes=%s",
+            ws_url,
+            source,
+            requested_scopes,
+            granted_scopes,
+            missing_scopes,
+        )
+
+    @staticmethod
+    def _is_loopback_host(host: str) -> bool:
+        normalized = host.strip().strip("[]").lower()
+        if not normalized:
+            return False
+        if normalized == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(normalized).is_loopback
+        except ValueError:
+            return False
+
+    def _openclaw_ws_ssl_param(self, ws_url: str) -> bool | ssl.SSLContext | None:
+        parsed = urlparse(ws_url)
+        if parsed.scheme.lower() != "wss":
+            return None
+
+        verify_ssl = self.cfg.openclaw_ws_verify_ssl
+        if verify_ssl is None:
+            verify_ssl = not self._is_loopback_host(parsed.hostname or "")
+
+        ca_file = self.cfg.openclaw_ws_ca_file.strip()
+        if verify_ssl:
+            if not ca_file:
+                return None
+            return ssl.create_default_context(cafile=ca_file)
+
+        logging.warning(
+            "openclaw.ws ssl=disabled host=%s reason=%s",
+            parsed.hostname or "",
+            "config" if self.cfg.openclaw_ws_verify_ssl is not None else "loopback_auto",
+        )
+        if not ca_file:
+            return False
+
+        context = ssl.create_default_context(cafile=ca_file)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context
+
+    def _openclaw_ws_connect_kwargs(self, ws_url: str) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        ssl_param = self._openclaw_ws_ssl_param(ws_url)
+        if ssl_param is not None:
+            out["ssl"] = ssl_param
+        origin = self.cfg.openclaw_ws_origin.strip()
+        if origin:
+            out["headers"] = {"Origin": origin}
+        return out
 
     @staticmethod
     def _extract_text_from_content(content: object) -> str:
@@ -361,7 +465,11 @@ class OpenClawGatewayMixin:
 
             await self._close_shared_gateway()
 
-            ws = await self.session.ws_connect(ws_url, heartbeat=25)
+            ws = await self.session.ws_connect(
+                ws_url,
+                heartbeat=25,
+                **self._openclaw_ws_connect_kwargs(ws_url),
+            )
             connect_req_id = str(uuid.uuid4())
             deadline = asyncio.get_running_loop().time() + 15.0
             connected = False
@@ -406,6 +514,13 @@ class OpenClawGatewayMixin:
 
                 if packet.get("type") == "res" and packet.get("id") == connect_req_id:
                     if packet.get("ok") is True:
+                        payload = self._json_dict_or_empty(packet.get("payload"))
+                        self._log_granted_scopes(
+                            payload=payload,
+                            requested_scopes=self._scopes_list(),
+                            ws_url=ws_url,
+                            source="shared",
+                        )
                         connected = True
                         break
                     err = self._json_dict_or_empty(packet.get("error"))
@@ -542,7 +657,11 @@ class OpenClawGatewayMixin:
         self, ws_url: str, scopes: list[str] | None = None
     ) -> aiohttp.ClientWebSocketResponse:
         assert self.session is not None
-        ws = await self.session.ws_connect(ws_url, heartbeat=20)
+        ws = await self.session.ws_connect(
+            ws_url,
+            heartbeat=20,
+            **self._openclaw_ws_connect_kwargs(ws_url),
+        )
         deadline = asyncio.get_running_loop().time() + 15.0
         connect_req_id = str(uuid.uuid4())
         while True:
@@ -582,6 +701,14 @@ class OpenClawGatewayMixin:
                 continue
             if packet.get("type") == "res" and packet.get("id") == connect_req_id:
                 if packet.get("ok") is True:
+                    payload = self._json_dict_or_empty(packet.get("payload"))
+                    requested_scopes = scopes if scopes is not None else self._scopes_list()
+                    self._log_granted_scopes(
+                        payload=payload,
+                        requested_scopes=requested_scopes,
+                        ws_url=ws_url,
+                        source="probe",
+                    )
                     return ws
                 err = self._json_dict_or_empty(packet.get("error"))
                 await ws.close()
